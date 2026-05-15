@@ -1,6 +1,5 @@
 package com.wrbug.polymarketbot.api
 
-import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import okhttp3.ResponseBody
 import retrofit2.Response
@@ -185,14 +184,16 @@ interface PolymarketClobApi {
      * @param signatureType 签名类型枚举：0=EOA，1=POLY_PROXY，2=POLY_GNOSIS_SAFE，
      *                      3=POLY_DEPOSIT_WALLET（new deposit wallet flow 必须使用 3）
      * @param tokenId    仅当 assetType=CONDITIONAL 时必填，传 outcome token id
-     * @return 响应体本身不需要解析，调用方只看 HTTP 2xx
+     * @return 用 raw ResponseBody（不经 Gson 解析）。CLOB 该端点常回空 body，
+     *         若声明为 Response<JsonObject> 会触发 Gson "End of input at line 1 column 1 path $"。
+     *         调用方只看 HTTP 2xx。
      */
     @GET("/balance-allowance/update")
     suspend fun updateBalanceAllowance(
         @Query("asset_type") assetType: String,
         @Query("signature_type") signatureType: Int,
         @Query("token_id") tokenId: String? = null
-    ): Response<JsonObject>
+    ): Response<ResponseBody>
 }
 
 // 请求和响应数据类
