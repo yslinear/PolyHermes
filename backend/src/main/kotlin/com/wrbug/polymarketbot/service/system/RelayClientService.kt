@@ -1783,7 +1783,8 @@ class RelayClientService(
                     delay(pollIntervalMs)
                     continue
                 }
-                val obj = result.asJsonObject ?: run {
+                val obj = result.asJsonObject
+                if (obj == null) {
                     delay(pollIntervalMs)
                     continue
                 }
