@@ -74,32 +74,43 @@ interface BuilderRelayerApi {
     /**
      * 交易请求
      * 参考: builder-relayer-client/src/types.ts 的 TransactionRequest
+     *
+     * Type 取值：
+     *   - "SAFE"           Gnosis Safe 既有流程（需 signatureParams）
+     *   - "SAFE-CREATE"    部署 Gnosis Safe 代理（需 signatureParams）
+     *   - "PROXY"          Magic 既有流程（需 signatureParams）
+     *   - "WALLET-CREATE"  部署 deposit wallet ERC-1967 proxy（无 user signature，无 nonce，无 signatureParams）
+     *   - "WALLET"         deposit wallet 调用 batch（带 signature + depositWalletParams；signatureParams 不传）
+     * 参考: https://docs.polymarket.com/trading/deposit-wallets
      */
     data class TransactionRequest(
         @SerializedName("type")
-        val type: String,  // "SAFE" 或 "SAFE-CREATE"
-        
+        val type: String,
+
         @SerializedName("from")
-        val from: String,  // 用户地址（EOA）
-        
+        val from: String,  // 用户地址（EOA / owner）
+
         @SerializedName("to")
-        val to: String,  // 目标合约地址
-        
+        val to: String,  // 目标合约地址（factory 或 实际目标合约）
+
         @SerializedName("proxyWallet")
-        val proxyWallet: String,  // Safe 地址（proxyAddress）
-        
+        val proxyWallet: String? = null,  // Safe 地址（legacy 流程）；WALLET / WALLET-CREATE 不传
+
         @SerializedName("data")
-        val data: String,  // 调用数据（十六进制字符串，带 0x 前缀）
-        
+        val data: String? = null,  // 调用数据（legacy 流程使用）；WALLET 路径用 depositWalletParams.calls 表达
+
         @SerializedName("nonce")
-        val nonce: String? = null,  // Safe nonce（SAFE 必填，SAFE-CREATE 不传）
-        
+        val nonce: String? = null,  // SAFE / WALLET 必填，*-CREATE 不传
+
         @SerializedName("signature")
-        val signature: String,  // Safe 签名（packed signature，十六进制字符串，带 0x 前缀）
-        
+        val signature: String? = null,  // legacy = packed Safe sig；WALLET = 65-byte EIP-712；WALLET-CREATE 不传
+
         @SerializedName("signatureParams")
-        val signatureParams: SignatureParams,  // 签名参数
-        
+        val signatureParams: SignatureParams? = null,  // 仅 SAFE / SAFE-CREATE / PROXY 使用
+
+        @SerializedName("depositWalletParams")
+        val depositWalletParams: DepositWalletParams? = null,  // 仅 WALLET 类型使用
+
         @SerializedName("metadata")
         val metadata: String? = null  // 元数据（可选，最多 500 字符）
     )
@@ -238,6 +249,35 @@ interface BuilderRelayerApi {
     data class GetDeployedResponse(
         @SerializedName("deployed")
         val deployed: Boolean
+    )
+
+    /**
+     * Deposit wallet batch 参数（仅 type=WALLET 时使用）
+     * 参考: https://docs.polymarket.com/trading/deposit-wallets#submit-a-deposit-wallet-batch
+     */
+    data class DepositWalletParams(
+        @SerializedName("depositWallet")
+        val depositWallet: String,   // deposit wallet ERC-1967 proxy 地址
+
+        @SerializedName("deadline")
+        val deadline: String,        // Unix seconds (string)
+
+        @SerializedName("calls")
+        val calls: List<DepositWalletCall>
+    )
+
+    /**
+     * Deposit wallet 单个调用
+     */
+    data class DepositWalletCall(
+        @SerializedName("target")
+        val target: String,  // 目标合约地址
+
+        @SerializedName("value")
+        val value: String,   // 调用附带的 wei（通常 "0"）
+
+        @SerializedName("data")
+        val data: String     // calldata（含 0x 前缀）
     )
 }
 

@@ -38,7 +38,7 @@ object Eip712Encoder {
     private fun encodeAddress(address: String): ByteArray {
         val cleanAddress = address.removePrefix("0x").lowercase()
         val addressBytes = Numeric.hexStringToByteArray("0x$cleanAddress")
-        // 地址是 20 字节，需要左对齐到 32 字节
+        // 地址是 20 字节，需要左侧填充 0 至 32 字节（即地址放在低 20 字节，高 12 字节为零）
         return ByteArray(32).apply {
             System.arraycopy(addressBytes, 0, this, 12, addressBytes.size)
         }
@@ -424,6 +424,279 @@ object Eip712Encoder {
         System.arraycopy(paymentBytes, 0, encoded, 64, 32)
         System.arraycopy(receiverBytes, 0, encoded, 96, 32)
         return keccak256(encoded)
+    }
+
+    /**
+     * 编码 DepositWallet EIP-712 域分隔符
+     * Domain: { name:"DepositWallet", version:"1", chainId, verifyingContract: depositWalletAddress }
+     * 参考: https://docs.polymarket.com/trading/deposit-wallets#submit-a-deposit-wallet-batch
+     */
+    fun encodeDepositWalletDomain(
+        chainId: Long,
+        verifyingContract: String,
+        name: String = "DepositWallet",
+        version: String = "1"
+    ): ByteArray {
+        val domainTypeHash = encodeType(
+            "EIP712Domain",
+            listOf(
+                "name" to "string",
+                "version" to "string",
+                "chainId" to "uint256",
+                "verifyingContract" to "address"
+            )
+        )
+
+        val nameHash = encodeString(name)
+        val versionHash = encodeString(version)
+        val chainIdBytes = encodeUint256(BigInteger.valueOf(chainId))
+        val contractBytes = encodeAddress(verifyingContract)
+
+        val encoded = ByteArray(32 + 32 + 32 + 32 + 32)
+        System.arraycopy(domainTypeHash, 0, encoded, 0, 32)
+        System.arraycopy(nameHash, 0, encoded, 32, 32)
+        System.arraycopy(versionHash, 0, encoded, 64, 32)
+        System.arraycopy(chainIdBytes, 0, encoded, 96, 32)
+        System.arraycopy(contractBytes, 0, encoded, 128, 32)
+
+        return keccak256(encoded)
+    }
+
+    /**
+     * 编码单笔 deposit wallet Call (EIP-712 nested struct)
+     *   Call(address target, uint256 value, bytes data)
+     * structHash = keccak256(typeHash || pad32(target) || pad32(value) || keccak256(data))
+     */
+    private fun encodeDepositWalletCallStruct(target: String, value: BigInteger, data: String): ByteArray {
+        val typeHash = CALL_TYPE_HASH
+        val targetBytes = encodeAddress(target)
+        val valueBytes = encodeUint256(value)
+        val dataBytes = Numeric.hexStringToByteArray(if (data.startsWith("0x")) data else "0x$data")
+        val dataHash = keccak256(dataBytes)
+        val encoded = ByteArray(32 * 4)
+        System.arraycopy(typeHash, 0, encoded, 0, 32)
+        System.arraycopy(targetBytes, 0, encoded, 32, 32)
+        System.arraycopy(valueBytes, 0, encoded, 64, 32)
+        System.arraycopy(dataHash, 0, encoded, 96, 32)
+        return keccak256(encoded)
+    }
+
+    /**
+     * 编码 deposit wallet Batch 消息哈希
+     * 参考: https://docs.polymarket.com/trading/deposit-wallets#submit-a-deposit-wallet-batch
+     *
+     *   Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)
+     *   Call(address target,uint256 value,bytes data)
+     *
+     * 注意：EIP-712 嵌套类型按字母序串接到 main type 后；这里 "Batch(...)Call(...)"。
+     * calls 数组的 hash = keccak256(callStructHash_0 || callStructHash_1 || ...)
+     */
+    fun encodeDepositWalletBatch(
+        wallet: String,
+        nonce: BigInteger,
+        deadline: BigInteger,
+        calls: List<DepositWalletCallInput>
+    ): ByteArray {
+        require(calls.isNotEmpty()) { "DepositWallet Batch must contain at least one Call" }
+        val typeString = "Batch(address wallet,uint256 nonce,uint256 deadline,Call[] calls)" +
+            "Call(address target,uint256 value,bytes data)"
+        val typeHash = keccak256(typeString.toByteArray(StandardCharsets.UTF_8))
+
+        val walletBytes = encodeAddress(wallet)
+        val nonceBytes = encodeUint256(nonce)
+        val deadlineBytes = encodeUint256(deadline)
+
+        val callsConcat = ByteArray(32 * calls.size)
+        calls.forEachIndexed { idx, call ->
+            val callHash = encodeDepositWalletCallStruct(call.target, call.value, call.data)
+            System.arraycopy(callHash, 0, callsConcat, idx * 32, 32)
+        }
+        val callsArrayHash = keccak256(callsConcat)
+
+        val encoded = ByteArray(32 * 5)
+        System.arraycopy(typeHash, 0, encoded, 0, 32)
+        System.arraycopy(walletBytes, 0, encoded, 32, 32)
+        System.arraycopy(nonceBytes, 0, encoded, 64, 32)
+        System.arraycopy(deadlineBytes, 0, encoded, 96, 32)
+        System.arraycopy(callsArrayHash, 0, encoded, 128, 32)
+        return keccak256(encoded)
+    }
+
+    /**
+     * Deposit wallet Call 输入（与 BuilderRelayerApi.DepositWalletCall 解耦的内部表示）
+     */
+    data class DepositWalletCallInput(
+        val target: String,
+        val value: BigInteger,
+        val data: String  // 0x-prefixed hex 或 raw hex 均可
+    )
+
+    // ============================================================
+    // ERC-7739 / POLY_1271 (signatureType = 3) wrapped order signing
+    // ============================================================
+    //
+    // 参考实作（黄金样本来源）:
+    //   py-clob-client-v2/py_clob_client_v2/order_utils/exchange_order_builder_v2.py
+    //     - https://raw.githubusercontent.com/Polymarket/py-clob-client-v2/main/py_clob_client_v2/order_utils/exchange_order_builder_v2.py
+    //     - 关键函数: _build_poly_1271_order_signature (第 154-211 行附近)
+    //
+    // 概念：
+    //   1. 内部 contents = V2 Order 的 EIP-712 structHash（即既有 encodeExchangeOrder 的输出）
+    //   2. Solady / ERC-7739 包装：
+    //        TypedDataSign(Order contents,string name,string version,uint256 chainId,
+    //                     address verifyingContract,bytes32 salt)
+    //        Order(uint256 salt,address maker,address signer,uint256 tokenId,
+    //              uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,
+    //              uint256 timestamp,bytes32 metadata,bytes32 builder)
+    //      wallet 域字段：name="DepositWallet", version="1", chainId=current,
+    //                    verifyingContract=depositWalletAddress, salt=0x00..00
+    //   3. 最终被签名的 digest = keccak256(0x1901 || appDomainSeparator || typedDataSignStructHash)
+    //      其中 appDomainSeparator = CTF Exchange V2 EIP712Domain separator
+    //   4. wire signature 格式（appended bytes）:
+    //        0x || innerSig(65B, r||s||v) ||
+    //              appDomainSeparator(32B) ||
+    //              contentsHash(32B) ||
+    //              contentsType(utf-8 bytes of ORDER_TYPE_STRING) ||
+    //              uint16BE(contentsTypeLen)
+
+    /** ORDER_TYPE_STRING (UTF-8)，对应 ERC-7739 wrap 中的 contentsDescr */
+    private const val ORDER_TYPE_STRING: String =
+        "Order(uint256 salt,address maker,address signer,uint256 tokenId," +
+            "uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType," +
+            "uint256 timestamp,bytes32 metadata,bytes32 builder)"
+
+    /**
+     * DepositWallet Call(...) 单笔结构的 EIP-712 typeHash
+     * 提取为常量避免在每次 batch 调用中重复计算 keccak256
+     */
+    private val CALL_TYPE_HASH: ByteArray =
+        keccak256("Call(address target,uint256 value,bytes data)".toByteArray(StandardCharsets.UTF_8))
+
+    /**
+     * TypedDataSign type hash for POLY_1271 wrapped signature
+     *
+     * 参考 exchange_order_builder_v2.py 第 22-32 行 SOLADY_TYPE_STRING / SOLADY_TYPE_HASH
+     */
+    private fun soladyTypeHash(): ByteArray {
+        val typeString =
+            "TypedDataSign(Order contents,string name,string version,uint256 chainId," +
+                "address verifyingContract,bytes32 salt)" +
+                ORDER_TYPE_STRING
+        return keccak256(typeString.toByteArray(StandardCharsets.UTF_8))
+    }
+
+    /**
+     * 计算 ERC-7739 TypedDataSign struct hash
+     *
+     * 等价于 py 参考实作 _build_poly_1271_order_signature 中的 typed_data_sign_struct_hash 段：
+     *   keccak256(
+     *     soladyTypeHash || contentsHash ||
+     *     keccak256("DepositWallet") || keccak256("1") ||
+     *     uint256(chainId) || pad32(depositWalletAddress) || bytes32(0)
+     *   )
+     */
+    private fun encodeTypedDataSignStructHash(
+        contentsHash: ByteArray,
+        chainId: Long,
+        depositWalletAddress: String
+    ): ByteArray {
+        val typeHash = soladyTypeHash()
+        val nameHash = keccak256("DepositWallet".toByteArray(StandardCharsets.UTF_8))
+        val versionHash = keccak256("1".toByteArray(StandardCharsets.UTF_8))
+        val chainIdBytes = encodeUint256(BigInteger.valueOf(chainId))
+        val verifyingBytes = encodeAddress(depositWalletAddress)
+        val saltBytes = ByteArray(32)  // 固定全零 salt
+
+        val encoded = ByteArray(32 * 7)
+        var offset = 0
+        System.arraycopy(typeHash, 0, encoded, offset, 32); offset += 32
+        System.arraycopy(contentsHash, 0, encoded, offset, 32); offset += 32
+        System.arraycopy(nameHash, 0, encoded, offset, 32); offset += 32
+        System.arraycopy(versionHash, 0, encoded, offset, 32); offset += 32
+        System.arraycopy(chainIdBytes, 0, encoded, offset, 32); offset += 32
+        System.arraycopy(verifyingBytes, 0, encoded, offset, 32); offset += 32
+        System.arraycopy(saltBytes, 0, encoded, offset, 32)
+        return keccak256(encoded)
+    }
+
+    /**
+     * 计算 POLY_1271 待签 digest
+     *
+     * digest = keccak256(0x1901 || ctfExchangeDomainSeparator || typedDataSignStructHash)
+     *
+     * 调用方在此 digest 上以 owner / session signer 私钥做 secp256k1 签名，
+     * 得到 65-byte (r||s||v) 后再交给 [wrapPoly1271Signature] 组装上链格式。
+     */
+    fun computePoly1271Digest(
+        orderTypedDataHash: ByteArray,
+        ctfExchangeDomainSeparator: ByteArray,
+        depositWalletAddress: String,
+        chainId: Long
+    ): ByteArray {
+        require(orderTypedDataHash.size == 32) { "orderTypedDataHash 必须为 32 bytes" }
+        require(ctfExchangeDomainSeparator.size == 32) { "ctfExchangeDomainSeparator 必须为 32 bytes" }
+        val tdsStructHash = encodeTypedDataSignStructHash(
+            contentsHash = orderTypedDataHash,
+            chainId = chainId,
+            depositWalletAddress = depositWalletAddress
+        )
+        return hashStructuredData(ctfExchangeDomainSeparator, tdsStructHash)
+    }
+
+    /**
+     * 组装 POLY_1271 / ERC-7739 wrapped 签名上链格式
+     *
+     * 参考: exchange_order_builder_v2.py 第 200-210 行
+     *   return (
+     *     "0x"
+     *     + inner_signature                  # 65 bytes (r||s||v, v in {27,28})
+     *     + self.app_domain_separator.hex()  # 32 bytes
+     *     + contents_hash.hex()              # 32 bytes
+     *     + contents_type                    # utf-8 bytes of ORDER_TYPE_STRING
+     *     + contents_type_len                # uint16 BE
+     *   )
+     *
+     * @param orderTypedDataHash V2 Order structHash（即 encodeExchangeOrder 结果）
+     * @param ctfExchangeDomainSeparator CTF Exchange V2 EIP-712 domain separator
+     * @param depositWalletAddress deposit wallet 地址（即 ERC-1271 验证合约）
+     *                              注意：当前实作未使用此参数，但保留在 API 中以便日后可读性 / 校验
+     * @param chainId 链 ID（同上，保留以维持调用方 ergonomics）
+     * @param signature65Bytes secp256k1 签名 r||s||v，长度必须为 65；v 应为 27/28（web3j Sign.signMessage(..., false)）
+     * @return wrap 后的完整 signature 字节数组（含上述五段拼接）
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun wrapPoly1271Signature(
+        orderTypedDataHash: ByteArray,
+        ctfExchangeDomainSeparator: ByteArray,
+        depositWalletAddress: String,
+        chainId: Long,
+        signature65Bytes: ByteArray
+    ): ByteArray {
+        require(signature65Bytes.size == 65) {
+            "POLY_1271 inner signature 必须为 65 bytes (r||s||v)，实际 ${signature65Bytes.size}"
+        }
+        require(orderTypedDataHash.size == 32) { "orderTypedDataHash 必须为 32 bytes" }
+        require(ctfExchangeDomainSeparator.size == 32) { "ctfExchangeDomainSeparator 必须为 32 bytes" }
+
+        val contentsTypeBytes = ORDER_TYPE_STRING.toByteArray(StandardCharsets.UTF_8)
+        val typeLen = contentsTypeBytes.size
+        require(typeLen <= 0xFFFF) { "contentsType 长度超过 uint16 上限" }
+        val typeLenBytes = byteArrayOf(
+            ((typeLen shr 8) and 0xFF).toByte(),
+            (typeLen and 0xFF).toByte()
+        )
+
+        // 65 + 32 + 32 + N + 2
+        val total = 65 + 32 + 32 + contentsTypeBytes.size + 2
+        val out = ByteArray(total)
+        var offset = 0
+        System.arraycopy(signature65Bytes, 0, out, offset, 65); offset += 65
+        System.arraycopy(ctfExchangeDomainSeparator, 0, out, offset, 32); offset += 32
+        System.arraycopy(orderTypedDataHash, 0, out, offset, 32); offset += 32
+        System.arraycopy(contentsTypeBytes, 0, out, offset, contentsTypeBytes.size)
+        offset += contentsTypeBytes.size
+        System.arraycopy(typeLenBytes, 0, out, offset, 2)
+        return out
     }
 }
 

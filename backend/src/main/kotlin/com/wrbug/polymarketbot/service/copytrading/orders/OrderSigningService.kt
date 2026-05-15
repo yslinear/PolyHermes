@@ -41,6 +41,19 @@ class OrderSigningService {
         return if (walletTypeEnum == com.wrbug.polymarketbot.enums.WalletType.MAGIC) 1 else 2
     }
 
+    /**
+     * 根据钱包流程 + 钱包类型返回签名类型
+     * - DEPOSIT_WALLET 流程：固定回传 3 (POLY_1271)
+     * - 其他流程：委派给 [getSignatureTypeForWalletType]
+     */
+    fun getSignatureTypeForWalletFlow(walletFlowType: String?, walletType: String?): Int {
+        val flow = com.wrbug.polymarketbot.enums.WalletFlowType.fromStringOrDefault(walletFlowType)
+        return when (flow) {
+            com.wrbug.polymarketbot.enums.WalletFlowType.DEPOSIT_WALLET -> 3
+            com.wrbug.polymarketbot.enums.WalletFlowType.LEGACY -> getSignatureTypeForWalletType(walletType)
+        }
+    }
+
     // V2 合约地址
     private val EXCHANGE_CONTRACT = "0xE111180000d2663C0091e4f400237545B87B996B"
     private val NEG_RISK_EXCHANGE_CONTRACT = "0xe2222d279d744050d28e00520010520000310F59"
@@ -178,6 +191,22 @@ class OrderSigningService {
         exchangeContract: String? = null
     ): SignedOrderObject {
         try {
+            // POLY_1271 (signatureType=3) 走独立的 ERC-7739 wrap 路径
+            //   - maker / signer 必须同为 deposit wallet 地址
+            //   - 调用方需透过 [createAndSignOrderForDepositWallet] 显式提供 depositWalletAddress
+            // 当此函数被以 signatureType=3 调用时，要求 makerAddress 即为 depositWalletAddress。
+            if (signatureType == 3) {
+                return createAndSignOrderForDepositWallet(
+                    privateKey = privateKey,
+                    depositWalletAddress = makerAddress,
+                    tokenId = tokenId,
+                    side = side,
+                    price = price,
+                    size = size,
+                    exchangeContract = exchangeContract
+                )
+            }
+
             // 1. 从私钥获取签名地址
             val cleanPrivateKey = privateKey.removePrefix("0x")
             val privateKeyBigInt = BigInteger(cleanPrivateKey, 16)
@@ -312,7 +341,167 @@ class OrderSigningService {
             throw RuntimeException("订单签名失败 (V2): ${e.message}", e)
         }
     }
-    
+
+    /**
+     * 创建并签名 Deposit Wallet (POLY_1271 / signatureType=3) 订单
+     *
+     * 参考: https://docs.polymarket.com/trading/deposit-wallets#place-clob-orders
+     *
+     * 与 legacy 路径的关键差异：
+     *   - signatureType = 3
+     *   - maker = signer = depositWalletAddress
+     *   - signature 是 ERC-7739 包覆后的 POLY_1271 签名（长度 > 65 byte）
+     *
+     * **Phase 2 实作状态**：ERC-7739 nested TypedDataSign 包覆部分需要参考
+     * `@polymarket/clob-client-v2` 或 `py-clob-client-v2` 的实作做黄金样本对拷验证。
+     * 在对拷未通过前，本方法 throw NotImplementedError 作为安全门。
+     *
+     * 调用方约束：
+     *   - depositWalletAddress 必须已经透过 [com.wrbug.polymarketbot.service.system.RelayClientService.deployDepositWalletViaBuilderRelayer]
+     *     部署完成并确认链上 STATE_CONFIRMED
+     *   - privateKey 须为该 deposit wallet 的 owner / session signer
+     */
+    fun createAndSignOrderForDepositWallet(
+        privateKey: String,
+        depositWalletAddress: String,
+        tokenId: String,
+        side: String,
+        price: String,
+        size: String,
+        exchangeContract: String? = null
+    ): SignedOrderObject {
+        try {
+            // 参考实作 (golden sample):
+            //   py-clob-client-v2/py_clob_client_v2/order_utils/exchange_order_builder_v2.py
+            //   _build_poly_1271_order_signature  (大约第 154-211 行)
+            //   URL: https://raw.githubusercontent.com/Polymarket/py-clob-client-v2/main/py_clob_client_v2/order_utils/exchange_order_builder_v2.py
+            //
+            // 流程：
+            //   1. inner Order：maker = signer = depositWalletAddress (小写, lowercase)
+            //   2. 计算 V2 Order structHash (contents) 用既有 Eip712Encoder.encodeExchangeOrder
+            //   3. 计算 CTF Exchange V2 domain separator (appDomainSeparator)
+            //   4. 计算 ERC-7739 / Solady TypedDataSign digest =
+            //        keccak256(0x1901 || appDomainSeparator || typedDataSignStructHash)
+            //      typedDataSignStructHash 内含 wallet domain (DepositWallet/1/chainId/depositWallet/0x00..)
+            //   5. owner / session signer 私钥对 digest 做 secp256k1 签名 (65 byte, v in {27,28})
+            //   6. wire signature =
+            //        innerSig(65) || appDomainSeparator(32) || contentsHash(32) ||
+            //        utf8(ORDER_TYPE_STRING) || uint16BE(typeLen)
+
+            // ---- 1) 私钥 / 签名地址 ----
+            val cleanPrivateKey = privateKey.removePrefix("0x")
+            val privateKeyBigInt = BigInteger(cleanPrivateKey, 16)
+            val credentials = Credentials.create(privateKeyBigInt.toString(16))
+            val ecKeyPair = credentials.ecKeyPair
+
+            // ---- 2) 订单字段 ----
+            val depositWalletLower = depositWalletAddress.lowercase()
+            val amounts = calculateOrderAmounts(side, size, price)
+            val salt = generateSalt()
+            val timestamp = System.currentTimeMillis().toString()
+            val metadata = "0x0000000000000000000000000000000000000000000000000000000000000000"
+            val builder = "0x0000000000000000000000000000000000000000000000000000000000000000"
+            val sideUpper = side.uppercase()
+
+            val contract = (exchangeContract?.takeIf { it.isNotBlank() } ?: EXCHANGE_CONTRACT).lowercase()
+
+            logger.debug("========== POLY_1271 (signatureType=3) 订单签名 ==========")
+            logger.debug("Side: $sideUpper, price: $price, size: $size")
+            logger.debug("TokenId: $tokenId")
+            logger.debug("DepositWallet (maker=signer): ${depositWalletLower.take(10)}...${depositWalletLower.takeLast(6)}")
+            logger.debug("Owner signer: ${credentials.address.lowercase()}")
+            logger.debug("Exchange: $contract, ChainId: $CHAIN_ID")
+            logger.debug("Salt: $salt, Timestamp: $timestamp")
+
+            // ---- 3) inner Order structHash (contentsHash) ----
+            val orderStructHash = com.wrbug.polymarketbot.util.Eip712Encoder.encodeExchangeOrder(
+                salt = salt,
+                maker = depositWalletLower,
+                signer = depositWalletLower,
+                tokenId = tokenId,
+                makerAmount = amounts.makerAmount,
+                takerAmount = amounts.takerAmount,
+                side = sideUpper,
+                signatureType = 3,
+                timestamp = timestamp,
+                metadata = metadata,
+                builder = builder
+            )
+
+            // ---- 4) CTF Exchange V2 domain separator ----
+            val appDomainSeparator = com.wrbug.polymarketbot.util.Eip712Encoder.encodeExchangeDomain(
+                chainId = CHAIN_ID,
+                verifyingContract = contract
+            )
+
+            // ---- 5) 待签 digest (ERC-7739 TypedDataSign) ----
+            val digest = com.wrbug.polymarketbot.util.Eip712Encoder.computePoly1271Digest(
+                orderTypedDataHash = orderStructHash,
+                ctfExchangeDomainSeparator = appDomainSeparator,
+                depositWalletAddress = depositWalletLower,
+                chainId = CHAIN_ID
+            )
+
+            // ---- 6) ECDSA 签名 (65 byte, v ∈ {27,28}) ----
+            val sig = org.web3j.crypto.Sign.signMessage(digest, ecKeyPair, false)
+            val rBytes = leftPad32(sig.r)
+            val sBytes = leftPad32(sig.s)
+            val vBytes = sig.v
+            val vInt = if (vBytes.isNotEmpty()) (vBytes[0].toInt() and 0xff) else 0
+            val rsv = ByteArray(65)
+            System.arraycopy(rBytes, 0, rsv, 0, 32)
+            System.arraycopy(sBytes, 0, rsv, 32, 32)
+            rsv[64] = vInt.toByte()
+
+            // ---- 7) wrap 成上链格式 ----
+            val wrapped = com.wrbug.polymarketbot.util.Eip712Encoder.wrapPoly1271Signature(
+                orderTypedDataHash = orderStructHash,
+                ctfExchangeDomainSeparator = appDomainSeparator,
+                depositWalletAddress = depositWalletLower,
+                chainId = CHAIN_ID,
+                signature65Bytes = rsv
+            )
+            val signatureHex = "0x" + wrapped.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+            // ---- 8) 组装回传 ----
+            return SignedOrderObject(
+                salt = salt,
+                maker = depositWalletLower,
+                signer = depositWalletLower,
+                taker = "0x0000000000000000000000000000000000000000",
+                tokenId = tokenId,
+                makerAmount = amounts.makerAmount,
+                takerAmount = amounts.takerAmount,
+                side = sideUpper,
+                signatureType = 3,
+                timestamp = timestamp,
+                expiration = "0",
+                metadata = metadata,
+                builder = builder,
+                signature = signatureHex
+            )
+        } catch (e: Exception) {
+            logger.error("POLY_1271 deposit wallet 订单签名失败", e)
+            throw RuntimeException("POLY_1271 订单签名失败: ${e.message}", e)
+        }
+    }
+
+    /**
+     * 将 BigInteger 转成左对齐到 32 byte 的 byte array。
+     * 用于将 web3j Sign.SignatureData.r/s (本身可能 <=32 byte) 标准化成 EIP-2 / ERC-1271 期待的固定 32-byte 形式。
+     */
+    private fun leftPad32(value: ByteArray): ByteArray {
+        if (value.size == 32) return value
+        val out = ByteArray(32)
+        if (value.size < 32) {
+            System.arraycopy(value, 0, out, 32 - value.size, value.size)
+        } else {
+            // 极端情况：BigInteger 可能多一字节符号位
+            System.arraycopy(value, value.size - 32, out, 0, 32)
+        }
+        return out
+    }
+
     /** 并发安全：确保同一毫秒内多次调用生成唯一 salt，避免 FIXED 模式预签双单等场景的 salt 碰撞 */
     private val saltSequence = AtomicLong(0)
 

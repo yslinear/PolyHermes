@@ -254,8 +254,9 @@ class AccountController(
                 return ResponseEntity.ok(ApiResponse.error(ErrorCode.PARAM_ACCOUNT_ID_INVALID, messageSource = messageSource))
             }
             val step = request.step ?: 0
-            if (step !in 1..3) {
-                return ResponseEntity.ok(ApiResponse.error(ErrorCode.PARAM_ERROR, "步骤必须为 1、2 或 3", messageSource))
+            // LEGACY 流程支援 1-3；DEPOSIT_WALLET 流程支援 1-4 (deploy / trading / approve / syncBalance)
+            if (step !in 1..4) {
+                return ResponseEntity.ok(ApiResponse.error(ErrorCode.PARAM_ERROR, "步骤必须为 1、2、3 或 4", messageSource))
             }
             val result = runBlocking { accountService.executeSetupStep(request.accountId, step) }
             result.fold(

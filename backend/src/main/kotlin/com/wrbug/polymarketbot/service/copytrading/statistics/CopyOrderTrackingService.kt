@@ -15,6 +15,7 @@ import org.springframework.dao.DataIntegrityViolationException
 import org.springframework.dao.DuplicateKeyException
 import java.sql.SQLException
 import java.util.concurrent.ConcurrentHashMap
+import com.wrbug.polymarketbot.enums.WalletFlowType
 import com.wrbug.polymarketbot.service.copytrading.configs.CopyTradingFilterService
 import com.wrbug.polymarketbot.service.copytrading.configs.FilterStatus
 import com.wrbug.polymarketbot.service.copytrading.orders.OrderSigningService
@@ -56,6 +57,40 @@ open class CopyOrderTrackingService(
 ) : ApplicationContextAware {
 
     private val logger = LoggerFactory.getLogger(CopyOrderTrackingService::class.java)
+
+    /**
+     * 根据 wallet_flow_type 解析订单的 maker / funder 地址：
+     *   - LEGACY 流程：使用 proxy_address（既有 Magic / Safe 路径）
+     *   - DEPOSIT_WALLET 流程：使用 deposit_wallet_address；为空则抛出，强制 Phase 3 setup 流程先完成部署
+     *
+     * 该 helper 与 [OrderSigningService.getSignatureTypeForWalletFlow] 配套使用。
+     */
+    private fun resolveMakerAddress(account: Account): String {
+        val flow = WalletFlowType.fromStringOrDefault(account.walletFlowType)
+        return when (flow) {
+            WalletFlowType.DEPOSIT_WALLET ->
+                account.depositWalletAddress
+                    ?: throw IllegalStateException(
+                        "Account ${account.id} 设为 DEPOSIT_WALLET 但 deposit_wallet_address 为空；" +
+                        "请先完成 deposit wallet 部署流程"
+                    )
+            WalletFlowType.LEGACY -> account.proxyAddress
+        }
+    }
+
+    /**
+     * 检查账号是否可下单。DEPOSIT_WALLET 流程必须已部署 (depositWalletAddress != null)。
+     * 用于在调用 [resolveMakerAddress] 之前提早过滤，避免未部署的 DEPOSIT_WALLET 账号
+     * 抛出 IllegalStateException 进而把整个交易处理回圈打断。
+     */
+    private fun isAccountTradeReady(account: Account): Boolean {
+        val flow = WalletFlowType.fromStringOrDefault(account.walletFlowType)
+        if (flow == WalletFlowType.DEPOSIT_WALLET && account.depositWalletAddress.isNullOrBlank()) {
+            logger.warn("跳过未部署的 DEPOSIT_WALLET 账号 ${account.id}（depositWalletAddress 为空）")
+            return false
+        }
+        return true
+    }
 
     // 协程作用域（用于异步发送通知）
     private val notificationScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -255,6 +290,11 @@ open class CopyOrderTrackingService(
 
                     // 验证账户是否启用
                     if (!account.isEnabled) {
+                        continue
+                    }
+
+                    // DEPOSIT_WALLET 账号必须已部署才有 maker 地址，否则后续 resolveMakerAddress 会抛异常
+                    if (!isAccountTradeReady(account)) {
                         continue
                     }
 
@@ -575,7 +615,7 @@ open class CopyOrderTrackingService(
                     val createOrderResult = createOrderWithRetry(
                         clobApi = clobApi,
                         privateKey = decryptedPrivateKey,
-                        makerAddress = account.proxyAddress,
+                        makerAddress = resolveMakerAddress(account),
                         walletAddress = account.walletAddress,
                         exchangeContract = exchangeContract,
                         tokenId = tokenId,
@@ -585,7 +625,7 @@ open class CopyOrderTrackingService(
                         owner = account.apiKey,
                         copyTradingId = copyTrading.id!!,
                         tradeId = trade.id,
-                        signatureType = orderSigningService.getSignatureTypeForWalletType(account.walletType)
+                        signatureType = orderSigningService.getSignatureTypeForWalletFlow(account.walletFlowType, account.walletType)
                     )
 
                     // 处理订单创建失败
@@ -868,6 +908,11 @@ open class CopyOrderTrackingService(
             return
         }
 
+        // DEPOSIT_WALLET 账号必须已部署才有 maker 地址，否则 resolveMakerAddress 会抛异常并打断卖出匹配
+        if (!isAccountTradeReady(account)) {
+            return
+        }
+
         // 2. 查找未匹配的买入订单（FIFO顺序）
         // 直接使用outcomeIndex匹配，而不是转换为YES/NO
         if (leaderSellTrade.outcomeIndex == null) {
@@ -1013,16 +1058,16 @@ open class CopyOrderTrackingService(
         val exchangeContractSell = orderSigningService.getExchangeContract(negRiskSell)
         if (negRiskSell) logger.debug("卖出市场为 Neg Risk，使用 Neg Risk Exchange 签约: conditionId=${leaderSellTrade.market}")
 
-        // 10. 创建并签名卖出订单（按账户钱包类型使用对应 signatureType）
+        // 10. 创建并签名卖出订单（按账户钱包流程使用对应 maker + signatureType）
         val signedOrder = try {
             orderSigningService.createAndSignOrder(
                 privateKey = decryptedPrivateKey,
-                makerAddress = account.proxyAddress,
+                makerAddress = resolveMakerAddress(account),
                 tokenId = tokenId,
                 side = "SELL",
                 price = sellPrice.toString(),
                 size = totalMatched.toString(),
-                signatureType = orderSigningService.getSignatureTypeForWalletType(account.walletType),
+                signatureType = orderSigningService.getSignatureTypeForWalletFlow(account.walletFlowType, account.walletType),
                 exchangeContract = exchangeContractSell
             )
         } catch (e: Exception) {
@@ -1051,7 +1096,7 @@ open class CopyOrderTrackingService(
         val createOrderResult = createOrderWithRetry(
             clobApi = clobApi,
             privateKey = decryptedPrivateKey,
-            makerAddress = account.proxyAddress,
+            makerAddress = resolveMakerAddress(account),
             walletAddress = account.walletAddress,
             exchangeContract = exchangeContractSell,
             tokenId = tokenId,
@@ -1061,7 +1106,7 @@ open class CopyOrderTrackingService(
             owner = account.apiKey,
             copyTradingId = copyTrading.id,
             tradeId = leaderSellTrade.id,
-            signatureType = orderSigningService.getSignatureTypeForWalletType(account.walletType)
+            signatureType = orderSigningService.getSignatureTypeForWalletFlow(account.walletFlowType, account.walletType)
         )
 
         if (createOrderResult.isFailure) {

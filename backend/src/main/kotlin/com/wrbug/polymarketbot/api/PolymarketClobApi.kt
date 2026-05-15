@@ -1,5 +1,6 @@
 package com.wrbug.polymarketbot.api
 
+import com.google.gson.JsonObject
 import com.google.gson.annotations.SerializedName
 import okhttp3.ResponseBody
 import retrofit2.Response
@@ -169,6 +170,29 @@ interface PolymarketClobApi {
      */
     @GET("/time")
     suspend fun getServerTime(): Response<ResponseBody>
+
+    /**
+     * 同步 CLOB balance / allowance 缓存
+     * 文档: https://docs.polymarket.com/trading/deposit-wallets
+     * 端点: GET /balance-allowance/update
+     * 需要 L2 认证（POLY_ADDRESS / POLY_SIGNATURE / POLY_TIMESTAMP / POLY_API_KEY / POLY_PASSPHRASE）
+     *
+     * 用于 deposit wallet flow step 4：在 deposit wallet 完成入金或授权后，
+     * 通知 CLOB 重新扫链刷新余额 / allowance 缓存，避免下单时被 CLOB 端的
+     * 旧缓存挡下。
+     *
+     * @param assetType  "COLLATERAL"（pUSD）或 "CONDITIONAL"（ERC-1155 outcome token）
+     * @param signatureType 签名类型枚举：0=EOA，1=POLY_PROXY，2=POLY_GNOSIS_SAFE，
+     *                      3=POLY_DEPOSIT_WALLET（new deposit wallet flow 必须使用 3）
+     * @param tokenId    仅当 assetType=CONDITIONAL 时必填，传 outcome token id
+     * @return 响应体本身不需要解析，调用方只看 HTTP 2xx
+     */
+    @GET("/balance-allowance/update")
+    suspend fun updateBalanceAllowance(
+        @Query("asset_type") assetType: String,
+        @Query("signature_type") signatureType: Int,
+        @Query("token_id") tokenId: String? = null
+    ): Response<JsonObject>
 }
 
 // 请求和响应数据类

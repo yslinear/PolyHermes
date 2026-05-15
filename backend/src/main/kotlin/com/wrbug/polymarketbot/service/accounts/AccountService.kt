@@ -3,6 +3,7 @@ package com.wrbug.polymarketbot.service.accounts
 import com.wrbug.polymarketbot.api.TradeResponse
 import com.wrbug.polymarketbot.dto.*
 import com.wrbug.polymarketbot.entity.Account
+import com.wrbug.polymarketbot.enums.WalletFlowType
 import com.wrbug.polymarketbot.enums.WalletType
 import com.wrbug.polymarketbot.repository.AccountRepository
 import com.wrbug.polymarketbot.util.RetrofitFactory
@@ -46,7 +47,8 @@ class AccountService(
     private val marketService: MarketService,  // 市场信息服务
     private val telegramNotificationService: TelegramNotificationService? = null,  // 可选，避免循环依赖
     private val relayClientService: RelayClientService,
-    private val jsonUtils: JsonUtils
+    private val jsonUtils: JsonUtils,
+    private val depositWalletSetupService: DepositWalletSetupService
 ) {
 
     private val logger = LoggerFactory.getLogger(AccountService::class.java)
@@ -395,6 +397,28 @@ class AccountService(
             val account = accountRepository.findById(accountId).orElse(null)
                 ?: return Result.failure(IllegalArgumentException("账户不存在"))
 
+            // ---- DEPOSIT_WALLET 流程 ----
+            // proxy/USDC 检查不适用；改判 deposit wallet 部署 / pUSD allowance / balance sync。
+            // step 3 (approveTokens) / step 4 (syncClobBalance) 完成后会写回
+            // depositWalletTokensApproved / depositWalletBalanceSynced 持久化标记，
+            // 此处直接读取以反映真实进度。
+            if (WalletFlowType.fromStringOrDefault(account.walletFlowType) == WalletFlowType.DEPOSIT_WALLET) {
+                val deployed = !account.depositWalletAddress.isNullOrBlank()
+                val tradingEnabled = account.apiKey != null && account.apiSecret != null && account.apiPassphrase != null
+                return Result.success(
+                    AccountSetupStatusDto(
+                        proxyDeployed = deployed,
+                        tradingEnabled = tradingEnabled,
+                        tokensApproved = account.depositWalletTokensApproved,
+                        approvalDetails = null,
+                        walletFlowType = WalletFlowType.DEPOSIT_WALLET.value,
+                        depositWalletAddress = account.depositWalletAddress,
+                        balanceSynced = account.depositWalletBalanceSynced,
+                        error = null
+                    )
+                )
+            }
+
             val proxyAddress = account.proxyAddress
             if (proxyAddress.isBlank()) {
                 return Result.success(
@@ -452,6 +476,37 @@ class AccountService(
     private val setupStep1RedirectUrl = "https://polymarket.com/settings/wallet"
 
     /**
+     * 共用的 setup step 2：创建 / 派生 CLOB API 凭证并写回账户。
+     * LEGACY 与 DEPOSIT_WALLET 流程对此步骤要求完全一致。
+     */
+    private suspend fun executeLegacyStep2(account: Account): Result<ExecuteSetupStepResponse> {
+        val privateKey = decryptPrivateKey(account)
+        val result = apiKeyService.createOrDeriveApiKey(
+            privateKey = privateKey,
+            walletAddress = account.walletAddress,
+            chainId = 137L
+        )
+        if (result.isFailure) {
+            val e = result.exceptionOrNull()
+            logger.error("启用交易（API Key）失败: accountId=${account.id}, ${e?.message}", e)
+            return Result.failure(e ?: IllegalStateException("获取 API Key 失败"))
+        }
+        val creds = result.getOrNull()
+            ?: return Result.failure(IllegalStateException("API Key 返回为空"))
+        val encryptedSecret = creds.secret.let { cryptoUtils.encrypt(it) }
+        val encryptedPassphrase = creds.passphrase.let { cryptoUtils.encrypt(it) }
+        val updated = account.copy(
+            apiKey = creds.apiKey,
+            apiSecret = encryptedSecret,
+            apiPassphrase = encryptedPassphrase,
+            updatedAt = System.currentTimeMillis()
+        )
+        accountRepository.save(updated)
+        orderPushService.refreshSubscriptions()
+        return Result.success(ExecuteSetupStepResponse(success = true))
+    }
+
+    /**
      * 执行设置步骤（由后端实现或返回跳转）
      * 步骤1：仅返回跳转 URL，由用户前往 Polymarket 完成部署
      * 步骤2：创建/派生 API Key 并更新账户
@@ -464,6 +519,51 @@ class AccountService(
             }
             val account = accountRepository.findById(accountId).orElse(null)
                 ?: return Result.failure(IllegalArgumentException("账户不存在"))
+
+            // ---- DEPOSIT_WALLET 流程 step 1/3/4 由 DepositWalletSetupService 处理；
+            //      step 2 (CLOB API key) 与 LEGACY 共用下方实作。
+            if (WalletFlowType.fromStringOrDefault(account.walletFlowType) == WalletFlowType.DEPOSIT_WALLET) {
+                return when (step) {
+                    1 -> depositWalletSetupService.deployDepositWallet(account).fold(
+                        onSuccess = { r ->
+                            Result.success(ExecuteSetupStepResponse(
+                                success = true,
+                                transactionHash = r.transactionHash
+                            ))
+                        },
+                        onFailure = { e ->
+                            logger.error("Deposit wallet 部署失败: accountId=$accountId, ${e.message}", e)
+                            Result.failure(e)
+                        }
+                    )
+                    2 -> executeLegacyStep2(account)  // 与 LEGACY 共用
+                    3 -> depositWalletSetupService.approveTokens(account).fold(
+                        onSuccess = { txHash ->
+                            Result.success(ExecuteSetupStepResponse(success = true, transactionHash = txHash))
+                        },
+                        onFailure = { e ->
+                            logger.error("Deposit wallet 授权失败: accountId=$accountId, ${e.message}", e)
+                            Result.failure(e)
+                        }
+                    )
+                    4 -> depositWalletSetupService.syncClobBalance(account).fold(
+                        onSuccess = { Result.success(ExecuteSetupStepResponse(success = true)) },
+                        onFailure = { e ->
+                            logger.error("Deposit wallet 余额同步失败: accountId=$accountId, ${e.message}", e)
+                            Result.failure(e)
+                        }
+                    )
+                    else -> Result.failure(IllegalArgumentException("DEPOSIT_WALLET 流程无效步骤: $step，应为 1-4"))
+                }
+            }
+
+            // LEGACY 流程仅支持 step 1-3；step 4 是 DEPOSIT_WALLET 专属的 CLOB balance sync，
+            // 显式拒绝以避免后续 else 分支抛出含混的 "无效的步骤" 讯息。
+            if (step == 4) {
+                return Result.failure(
+                    IllegalArgumentException("LEGACY 流程不支持步骤 4；step 4 仅适用于 DEPOSIT_WALLET 流程")
+                )
+            }
 
             when (step) {
                 1 -> {
@@ -507,32 +607,7 @@ class AccountService(
                         }
                     }
                 }
-                2 -> {
-                    val privateKey = decryptPrivateKey(account)
-                    val result = apiKeyService.createOrDeriveApiKey(
-                        privateKey = privateKey,
-                        walletAddress = account.walletAddress,
-                        chainId = 137L
-                    )
-                    if (result.isFailure) {
-                        val e = result.exceptionOrNull()
-                        logger.error("启用交易（API Key）失败: accountId=$accountId, ${e?.message}", e)
-                        return Result.failure(e ?: IllegalStateException("获取 API Key 失败"))
-                    }
-                    val creds = result.getOrNull()
-                        ?: return Result.failure(IllegalStateException("API Key 返回为空"))
-                    val encryptedSecret = creds.secret.let { cryptoUtils.encrypt(it) }
-                    val encryptedPassphrase = creds.passphrase.let { cryptoUtils.encrypt(it) }
-                    val updated = account.copy(
-                        apiKey = creds.apiKey,
-                        apiSecret = encryptedSecret,
-                        apiPassphrase = encryptedPassphrase,
-                        updatedAt = System.currentTimeMillis()
-                    )
-                    accountRepository.save(updated)
-                    orderPushService.refreshSubscriptions()
-                    Result.success(ExecuteSetupStepResponse(success = true))
-                }
+                2 -> executeLegacyStep2(account)
                 3 -> {
                     val proxyAddress = account.proxyAddress
                     if (proxyAddress.isBlank()) {

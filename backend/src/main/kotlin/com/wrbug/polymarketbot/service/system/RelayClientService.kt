@@ -68,6 +68,14 @@ class RelayClientService(
     private val RELAYER_TYPE_PROXY = "PROXY"
     private val RELAYER_TYPE_SAFE = "SAFE"
     private val RELAYER_TYPE_SAFE_CREATE = "SAFE-CREATE"
+    private val RELAYER_TYPE_WALLET_CREATE = "WALLET-CREATE"
+    private val RELAYER_TYPE_WALLET = "WALLET"
+
+    // Deposit Wallet 相关常量（Polymarket New API user flow）
+    private val depositWalletFactoryAddress = PolymarketConstants.DEPOSIT_WALLET_FACTORY_ADDRESS
+
+    /** Relayer transaction 进入终端状态（部署 / 调用是否成功的判定边界） */
+    private val relayerTerminalStates = setOf("STATE_MINED", "STATE_CONFIRMED", "STATE_FAILED", "STATE_INVALID")
 
     // Safe 代理工厂（用于 SAFE-CREATE 部署）
     private val safeProxyFactoryAddress = PolymarketConstants.SAFE_PROXY_FACTORY_ADDRESS
@@ -1392,6 +1400,466 @@ class RelayClientService(
                 "批量 Gasless 执行暂未实现。请使用 com.wrbug.polymarketbot.service.common.BlockchainService.redeemPositions() 方法。"
             )
         )
+    }
+
+    // ============================================================
+    // Deposit Wallet (POLY_1271) 流程
+    // 参考: https://docs.polymarket.com/trading/deposit-wallets
+    // ============================================================
+
+    /**
+     * Deposit wallet 部署结果
+     *
+     * @param transactionId Relayer 端的 transactionID
+     * @param transactionHash 链上交易哈希（mined 后才有）
+     * @param depositWalletAddress 部署成功后的 wallet 地址；如尚未从 receipt 解析则为 null
+     * @param state 最后查到的状态（STATE_MINED / STATE_CONFIRMED / STATE_FAILED 等）
+     */
+    data class DepositWalletDeployment(
+        val transactionId: String,
+        val transactionHash: String?,
+        val depositWalletAddress: String?,
+        val state: String
+    )
+
+    /**
+     * 透过 Builder Relayer 部署 Deposit Wallet (WALLET-CREATE)
+     *
+     * 与 SAFE-CREATE 不同：
+     *   1. payload 内无 user signature、无 nonce、无 signatureParams、无 data
+     *   2. to = Deposit Wallet Factory
+     *   3. 部署完成后 wallet address 由 factory 的 CREATE2 推导决定；可由
+     *      [deriveDepositWalletAddress] 计算或从交易 receipt event 解析
+     *
+     * @param ownerAddress 拥有此 deposit wallet 的 EOA 地址（owner / signer）
+     * @return [DepositWalletDeployment]；当 relayer 配额受限或 API 失败则 [Result.failure]
+     */
+    suspend fun deployDepositWalletViaBuilderRelayer(
+        ownerAddress: String
+    ): Result<DepositWalletDeployment> {
+        return try {
+            val relayerApi = getBuilderRelayerApi()
+                ?: return Result.failure(IllegalStateException("Builder API Key 未配置，无法部署 Deposit Wallet"))
+
+            val request = BuilderRelayerApi.TransactionRequest(
+                type = RELAYER_TYPE_WALLET_CREATE,
+                from = ownerAddress,
+                to = depositWalletFactoryAddress,
+                proxyWallet = null,
+                data = null,
+                nonce = null,
+                signature = null,
+                signatureParams = null,
+                depositWalletParams = null,
+                metadata = null
+            )
+
+            val response = withBuilderRelayerRateLimitRetry { relayerApi.submitTransaction(request) }
+            if (!response.isSuccessful || response.body() == null) {
+                val errorBody = response.errorBody()?.string() ?: "未知错误"
+                updateQuotaBlockedFromErrorBody(errorBody)
+                logger.error("Builder Relayer WALLET-CREATE 失败: code=${response.code()}, body=$errorBody")
+                return Result.failure(Exception("部署 Deposit Wallet 失败: ${response.code()} - $errorBody"))
+            }
+            val submitResp = response.body()!!
+            logger.info("Builder Relayer WALLET-CREATE 已提交: transactionID=${submitResp.transactionID}, state=${submitResp.state}")
+
+            val finalTx = pollRelayerTransaction(relayerApi, submitResp.transactionID)
+            val state = finalTx?.state ?: submitResp.state
+            if (finalTx != null && (finalTx.state == "STATE_FAILED" || finalTx.state == "STATE_INVALID")) {
+                return Result.failure(Exception("WALLET-CREATE 链上执行失败: $finalTx"))
+            }
+
+            Result.success(
+                DepositWalletDeployment(
+                    transactionId = submitResp.transactionID,
+                    transactionHash = finalTx?.transactionHash,
+                    // Phase 1 暂不从 receipt event 解析；调用方可结合 deriveDepositWalletAddress 推导
+                    // 或在 Phase 3 (DepositWalletSetupService) 内补 logs 解析
+                    depositWalletAddress = null,
+                    state = state
+                )
+            )
+        } catch (e: Exception) {
+            logger.error("部署 Deposit Wallet 失败: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 透过 Builder Relayer 提交 Deposit Wallet WALLET batch（多笔合约调用）
+     *
+     * 流程：
+     *   1. GET /nonce?address=<owner>&type=WALLET 取最新 nonce
+     *   2. 用 owner 私钥对 DepositWallet Batch typed-data 签 65-byte EIP-712
+     *   3. POST /submit { type:"WALLET", from, to=factory, nonce, signature, depositWalletParams }
+     *   4. 轮询 transaction state 至终端
+     *
+     * @param privateKey owner / session signer 私钥（hex，带或不带 0x）
+     * @param ownerAddress owner EOA 地址
+     * @param depositWalletAddress 此 owner 对应的 deposit wallet ERC-1967 proxy 地址
+     * @param calls Wallet Batch 内的调用列表
+     * @param deadlineSeconds Unix seconds；null 时默认 now+600
+     * @return Result<txHash>
+     */
+    suspend fun executeViaBuilderRelayerDepositWallet(
+        privateKey: String,
+        ownerAddress: String,
+        depositWalletAddress: String,
+        calls: List<BuilderRelayerApi.DepositWalletCall>,
+        deadlineSeconds: Long? = null
+    ): Result<String> {
+        return try {
+            val relayerApi = getBuilderRelayerApi()
+                ?: return Result.failure(IllegalStateException("Builder API Key 未配置，无法执行 Deposit Wallet batch"))
+
+            // 1. 取 WALLET nonce
+            val nonceResp = withBuilderRelayerRateLimitRetry {
+                relayerApi.getNonce(ownerAddress, RELAYER_TYPE_WALLET)
+            }
+            if (!nonceResp.isSuccessful || nonceResp.body() == null) {
+                val errBody = nonceResp.errorBody()?.string() ?: "未知错误"
+                updateQuotaBlockedFromErrorBody(errBody)
+                return Result.failure(Exception("获取 WALLET nonce 失败: ${nonceResp.code()} - $errBody"))
+            }
+            val walletNonce = nonceResp.body()!!.nonce
+
+            val deadline = (deadlineSeconds ?: (System.currentTimeMillis() / 1000 + 600)).toString()
+
+            // 2. 构造 DepositWallet Batch typed-data 并签名
+            val callInputs = calls.map {
+                Eip712Encoder.DepositWalletCallInput(
+                    target = it.target,
+                    value = BigInteger(it.value),
+                    data = it.data
+                )
+            }
+            val domainSeparator = Eip712Encoder.encodeDepositWalletDomain(
+                chainId = PolymarketConstants.POLYGON_CHAIN_ID,
+                verifyingContract = depositWalletAddress
+            )
+            val batchHash = Eip712Encoder.encodeDepositWalletBatch(
+                wallet = depositWalletAddress,
+                nonce = BigInteger(walletNonce),
+                deadline = BigInteger(deadline),
+                calls = callInputs
+            )
+            val digest = Eip712Encoder.hashStructuredData(domainSeparator, batchHash)
+
+            val cleanPrivateKey = privateKey.removePrefix("0x")
+            val privateKeyBigInt = BigInteger(cleanPrivateKey, 16)
+            val ecKeyPair = org.web3j.crypto.ECKeyPair.create(privateKeyBigInt)
+            val signatureData = org.web3j.crypto.Sign.signMessage(digest, ecKeyPair, false)
+            val signatureHex = signatureToStandardHex(signatureData)
+
+            // 3. 提交 WALLET batch
+            val request = BuilderRelayerApi.TransactionRequest(
+                type = RELAYER_TYPE_WALLET,
+                from = ownerAddress,
+                to = depositWalletFactoryAddress,
+                proxyWallet = null,
+                data = null,
+                nonce = walletNonce,
+                signature = signatureHex,
+                signatureParams = null,
+                depositWalletParams = BuilderRelayerApi.DepositWalletParams(
+                    depositWallet = depositWalletAddress,
+                    deadline = deadline,
+                    calls = calls
+                ),
+                metadata = null
+            )
+            val response = withBuilderRelayerRateLimitRetry { relayerApi.submitTransaction(request) }
+            if (!response.isSuccessful || response.body() == null) {
+                val errBody = response.errorBody()?.string() ?: "未知错误"
+                updateQuotaBlockedFromErrorBody(errBody)
+                logger.error("Builder Relayer WALLET 失败: code=${response.code()}, body=$errBody")
+                return Result.failure(Exception("提交 Deposit Wallet batch 失败: ${response.code()} - $errBody"))
+            }
+            val submitResp = response.body()!!
+            logger.info("Builder Relayer WALLET 已提交: transactionID=${submitResp.transactionID}, depositWallet=$depositWalletAddress")
+
+            // 4. 轮询至终端
+            val finalTx = pollRelayerTransaction(relayerApi, submitResp.transactionID)
+            if (finalTx == null) {
+                return Result.failure(Exception("WALLET 交易轮询超时: transactionID=${submitResp.transactionID}"))
+            }
+            if (finalTx.state == "STATE_FAILED" || finalTx.state == "STATE_INVALID") {
+                return Result.failure(Exception("WALLET 链上执行失败: state=${finalTx.state}, tx=${finalTx.transactionHash}"))
+            }
+            val txHash = finalTx.transactionHash
+            if (txHash.isBlank()) {
+                return Result.failure(Exception("WALLET 交易完成但 transactionHash 为空"))
+            }
+            Result.success(txHash)
+        } catch (e: Exception) {
+            logger.error("提交 Deposit Wallet batch 失败: ${e.message}", e)
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * 轮询 relayer transaction，直到状态进入 [relayerTerminalStates] 或达到最大尝试次数。
+     *
+     * @return 最后一次成功取回的 RelayerTransaction；轮询超时时返回 null
+     */
+    private suspend fun pollRelayerTransaction(
+        relayerApi: BuilderRelayerApi,
+        transactionId: String,
+        maxAttempts: Int = 60,
+        intervalMs: Long = 2_000L
+    ): BuilderRelayerApi.RelayerTransaction? {
+        repeat(maxAttempts) { attempt ->
+            try {
+                val resp = withBuilderRelayerRateLimitRetry { relayerApi.getTransaction(transactionId) }
+                if (resp.isSuccessful) {
+                    val tx = resp.body()?.firstOrNull()
+                    if (tx != null && tx.state in relayerTerminalStates) {
+                        logger.debug("Relayer transaction $transactionId 状态终态: ${tx.state} (attempt ${attempt + 1})")
+                        return tx
+                    }
+                }
+            } catch (e: Exception) {
+                logger.warn("轮询 relayer transaction $transactionId 失败 (attempt ${attempt + 1}): ${e.message}")
+            }
+            // 仅在尚未到达终态时 delay；最后一次尝试后不必再等
+            if (attempt < maxAttempts - 1) {
+                delay(intervalMs)
+            }
+        }
+        logger.warn("轮询 relayer transaction $transactionId 超时 (${maxAttempts} 次后仍未达终态)")
+        return null
+    }
+
+    /**
+     * 决定性推导 Deposit Wallet ERC-1967 proxy 地址（CREATE2 fallback）
+     *
+     * 公式（参考 https://docs.polymarket.com/trading/deposit-wallets）：
+     *   walletId     = bytes32(owner)                       // owner 左补 0 到 32 字节
+     *   args         = abi.encode(factory, walletId)        // 64 字节：32B factory + 32B walletId
+     *   salt         = keccak256(args)
+     *   bytecodeHash = SoladyLibClone.initCodeHashERC1967(implementation, args)
+     *   depositWallet = CREATE2(factory, salt, bytecodeHash)
+     *
+     * Solady ERC1967 minimal proxy with immutable args 的 init code 结构参考：
+     *   https://github.com/Polymarket/py-builder-relayer-client/blob/main/py_builder_relayer_client/builder/derive.py
+     *   （Solady 原始：https://github.com/Vectorized/solady/blob/main/src/utils/LibClone.sol initCodeHashERC1967WithImmutableArgs）
+     *
+     *   ERC1967_PREFIX = 0x61003D3D8160233D3973（10 字节，前 2 字节会嵌入 args 长度 n）
+     *   combined       = ERC1967_PREFIX + (n << 56)   // n 嵌入到 10 字节序列的第 2~3 字节位置
+     *   initCode       = combined(10B) || implementation(20B) || 0x6009 ||
+     *                    0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076 ||
+     *                    0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3 ||
+     *                    args
+     *   bytecodeHash   = keccak256(initCode)
+     *
+     * Polygon mainnet implementation 常量来源：
+     *   py-builder-relayer-client config.py CONFIG[137].deposit_wallet_implementation
+     */
+    fun deriveDepositWalletAddress(ownerAddress: String): String {
+        val implementation = PolymarketConstants.DEPOSIT_WALLET_IMPLEMENTATION_ADDRESS
+        val factory = depositWalletFactoryAddress
+
+        // walletId = bytes32(owner)：owner 左补 0 到 32 字节
+        val ownerHex = ownerAddress.removePrefix("0x").lowercase().padStart(40, '0')
+        val walletIdHex = ownerHex.padStart(64, '0')
+
+        // args = abi.encode(address factory, bytes32 walletId)
+        // address 编码为 32 字节（左补 0），bytes32 直接 32 字节
+        val factoryEncoded = EthereumUtils.encodeAddress(factory) // 64 个十六进制字符
+        val args = EthereumUtils.hexToBytes(factoryEncoded + walletIdHex) // 64 字节
+
+        // salt = keccak256(args)
+        val salt = EthereumUtils.keccak256(args)
+
+        // initCodeHash = keccak256(ERC1967 prefix + implementation + middle const + args)
+        val bytecodeHash = initCodeHashErc1967(implementation, args)
+
+        // CREATE2: keccak256(0xff || factory || salt || bytecodeHash)[12:]
+        val factoryBytes = EthereumUtils.hexToBytes(factory.removePrefix("0x").lowercase().padStart(40, '0'))
+        val create2Input = ByteArray(1 + 20 + 32 + 32)
+        create2Input[0] = 0xff.toByte()
+        System.arraycopy(factoryBytes, 0, create2Input, 1, 20)
+        System.arraycopy(salt, 0, create2Input, 21, 32)
+        System.arraycopy(bytecodeHash, 0, create2Input, 53, 32)
+        val addressHash = EthereumUtils.keccak256(create2Input)
+        val addressBytes = addressHash.copyOfRange(12, 32)
+        return "0x" + addressBytes.joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Solady LibClone.initCodeHashERC1967WithImmutableArgs 的 Kotlin 实现
+     * 参考 py-builder-relayer-client builder/derive.py init_code_hash_erc1967
+     *
+     *   ERC1967_PREFIX = 0x61003D3D8160233D3973（10 字节）
+     *   combined       = (ERC1967_PREFIX << 0) | (args.len << 56)
+     *                  → 也就是把 args.len 写入 prefix 的第 2~3 字节（PUSH2 的两个数据字节）
+     *   initCode       = combined(10B) || implementation(20B) ||
+     *                    0x6009 ||
+     *                    0x5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076 ||
+     *                    0xcc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3 ||
+     *                    args
+     */
+    private fun initCodeHashErc1967(implementation: String, args: ByteArray): ByteArray {
+        // ERC1967_PREFIX = 0x61003D3D8160233D3973（10 字节，第 2~3 字节预留给 args 长度）
+        // combined = prefix | (n << 56)，按 py 实现写回 10 字节 big-endian
+        // 0x61_00_00_3D3D8160233D3973 之后通过 OR 把 args 长度（uint16）填入第 2~3 字节
+        // py 实际公式：combined = ERC1967_PREFIX + (n << 56)
+        //   ERC1967_PREFIX = 0x61003D3D8160233D3973  （0x61_00_3D3D_8160_233D_3973，10 字节）
+        //   n << 56 → 把 n 放到 80-bit 整数从高位起第 2 字节（offset 1）开始的两个字节
+        // 注意 py 用整数加法（不是按位或），但由于 prefix 第 2~3 字节都是 0，加 == 或
+        val prefixBase = java.math.BigInteger("61003D3D8160233D3973", 16)
+        val n = args.size
+        // 把 n 当作 16-bit 放进 prefix 的第 2~3 字节（big-endian 10 字节中的 offset 1..2）
+        // 即 (n shl 56) 加到 80-bit BigInteger
+        val combined = prefixBase.add(java.math.BigInteger.valueOf(n.toLong()).shiftLeft(56))
+        val combinedBytes = combined.toByteArray().let { raw ->
+            // BigInteger.toByteArray 可能有 leading sign byte，需要规范化到 10 字节
+            val padded = ByteArray(10)
+            val src = if (raw.size > 10) raw.copyOfRange(raw.size - 10, raw.size) else raw
+            System.arraycopy(src, 0, padded, 10 - src.size, src.size)
+            padded
+        }
+
+        val implBytes = EthereumUtils.hexToBytes(implementation.removePrefix("0x").lowercase().padStart(40, '0'))
+        val midConst1 = EthereumUtils.hexToBytes("6009")
+        val midConst2 = EthereumUtils.hexToBytes("5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076")
+        val midConst3 = EthereumUtils.hexToBytes("cc3735a920a3ca505d382bbc545af43d6000803e6038573d6000fd5b3d6000f3")
+
+        val initCode = combinedBytes + implBytes + midConst1 + midConst2 + midConst3 + args
+        return EthereumUtils.keccak256(initCode)
+    }
+
+    /**
+     * 从 transaction receipt 解析 `WalletDeployed(address indexed wallet, address indexed owner)` 事件
+     * 取出 deposit wallet 部署地址（topic[1] = wallet, topic[2] = owner）。
+     *
+     * 流程：
+     *   1. 透过 polygonRpcApi 轮询 `eth_getTransactionReceipt`（最多 ~120s），等 receipt 上链
+     *   2. 在 receipt.logs 中找出 address == DEPOSIT_WALLET_FACTORY_ADDRESS 的事件
+     *   3. 用 keccak256("WalletDeployed(address,address)") 比对 topic[0]
+     *   4. 校验 topic[2] padded == ownerAddress；从 topic[1] 取最后 20 字节作为 wallet
+     *
+     * @param txHash 交易 hash（0x 前缀）
+     * @param ownerAddress 部署的 owner EOA 地址，用于校验
+     * @return 0x 前缀的小写 deposit wallet 地址；无法解析则 null
+     */
+    suspend fun parseDepositWalletAddressFromReceipt(
+        txHash: String,
+        ownerAddress: String,
+        maxWaitMs: Long = 120_000L,
+        pollIntervalMs: Long = 3_000L
+    ): String? {
+        val rpcApi = polygonRpcApi
+
+        // 计算 WalletDeployed 事件 topic0：keccak256("WalletDeployed(address,address,bytes32,address)")
+        // PolygonScan 验证：工厂合约 0x00000000000Fb5C9ADea0298D729A0CB3823Cc07 实际 emit 的事件为
+        //   WalletDeployed(address indexed wallet, address indexed owner, bytes32 indexed id, address implementation)
+        // 4 参数事件 → topic[0]=event sig, topic[1]=wallet, topic[2]=owner, topic[3]=id（id 为 indexed bytes32）
+        val walletDeployedTopic0 = "0x" + EthereumUtils.keccak256Hex(
+            "WalletDeployed(address,address,bytes32,address)".toByteArray(Charsets.UTF_8)
+        )
+
+        // owner padded 到 32 字节，用于和 topic[2] 比对
+        val ownerPadded = "0x" + EthereumUtils.encodeAddress(ownerAddress)
+
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < maxWaitMs) {
+            try {
+                val req = JsonRpcRequest(method = "eth_getTransactionReceipt", params = listOf(txHash))
+                val response = rpcApi.call(req)
+                if (!response.isSuccessful || response.body() == null) {
+                    delay(pollIntervalMs)
+                    continue
+                }
+                val body = response.body()!!
+                if (body.error != null) {
+                    logger.warn("eth_getTransactionReceipt 返回错误: ${body.error.message}")
+                    delay(pollIntervalMs)
+                    continue
+                }
+                val result = body.result
+                if (result == null || result.isJsonNull) {
+                    delay(pollIntervalMs)
+                    continue
+                }
+                val obj = result.asJsonObject ?: run {
+                    delay(pollIntervalMs)
+                    continue
+                }
+                val logs = obj.getAsJsonArray("logs") ?: return null
+                val factoryAddrLower = depositWalletFactoryAddress.lowercase()
+                for (logElement in logs) {
+                    val logObj = logElement.asJsonObject ?: continue
+                    val addr = logObj.get("address")?.asString?.lowercase() ?: continue
+                    if (addr != factoryAddrLower) continue
+
+                    val topics = logObj.getAsJsonArray("topics") ?: continue
+                    if (topics.size() < 4) continue
+
+                    val topic0 = topics[0]?.asString?.lowercase() ?: continue
+                    if (topic0 != walletDeployedTopic0.lowercase()) continue
+
+                    val topic1 = topics[1]?.asString ?: continue // wallet
+                    val topic2 = topics[2]?.asString ?: continue // owner
+
+                    // 校验 owner topic（topic[2]）= owner padded
+                    if (topic2.lowercase() != ownerPadded.lowercase()) {
+                        logger.debug(
+                            "WalletDeployed event owner topic 不匹配: expected={}, got={}",
+                            ownerPadded, topic2
+                        )
+                        continue
+                    }
+
+                    // topic[1] 是 32 字节，取最后 20 字节为 wallet 地址
+                    val walletHex = topic1.removePrefix("0x").lowercase().padStart(64, '0').takeLast(40)
+                    val walletAddress = "0x$walletHex"
+                    logger.info(
+                        "解析 WalletDeployed 事件成功: tx={}, wallet={}, owner={}",
+                        txHash, walletAddress, ownerAddress
+                    )
+                    return walletAddress
+                }
+                // receipt 已取得但没有匹配的事件 → 直接返回 null（不再轮询）
+                logger.warn("Receipt 已取得但未找到 WalletDeployed 事件: tx=$txHash")
+                return null
+            } catch (e: Exception) {
+                logger.warn("解析 WalletDeployed receipt 失败 (retry): ${e.message}")
+                delay(pollIntervalMs)
+            }
+        }
+        logger.warn("解析 WalletDeployed receipt 超时 (${maxWaitMs}ms): tx=$txHash")
+        return null
+    }
+
+    /**
+     * 查询 deposit wallet 是否已部署（透过 BuilderRelayer GET /deployed?address=...）
+     *
+     * 包装 [BuilderRelayerApi.getDeployed] 公开给上层服务（[com.wrbug.polymarketbot.service.accounts.DepositWalletSetupService]）。
+     *
+     * @param depositWalletAddress deposit wallet ERC-1967 proxy 地址
+     * @return true 表示 relayer 端已确认部署；任何错误 / Builder API Key 未配置时返回 false（保守判定）
+     */
+    suspend fun isDepositWalletDeployed(depositWalletAddress: String): Boolean {
+        if (depositWalletAddress.isBlank() || !depositWalletAddress.startsWith("0x")) return false
+        return try {
+            val relayerApi = getBuilderRelayerApi() ?: run {
+                logger.warn("Builder API Key 未配置，isDepositWalletDeployed 返回 false")
+                return false
+            }
+            val response = withBuilderRelayerRateLimitRetry { relayerApi.getDeployed(depositWalletAddress) }
+            if (!response.isSuccessful || response.body() == null) {
+                val errorBody = response.errorBody()?.string() ?: "未知错误"
+                updateQuotaBlockedFromErrorBody(errorBody)
+                logger.warn("查询 deposit wallet 部署状态失败: code=${response.code()}, body=$errorBody")
+                return false
+            }
+            response.body()!!.deployed
+        } catch (e: Exception) {
+            logger.warn("查询 deposit wallet 部署状态异常: ${e.message}")
+            false
+        }
     }
 }
 
