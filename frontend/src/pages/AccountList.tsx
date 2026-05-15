@@ -329,21 +329,44 @@ const AccountList: React.FC = () => {
       title: t('accountList.proxyAddress'),
       dataIndex: 'proxyAddress',
       key: 'proxyAddress',
-      render: (address: string) => {
+      render: (address: string, record: Account) => {
         const formatted = address ? `${address.slice(0, 6)}...${address.slice(-4)}` : '-'
+        const isDeposit = record.walletFlowType === 'DEPOSIT_WALLET'
+        const depositAddr = record.depositWalletAddress
+        const depositFormatted = depositAddr ? `${depositAddr.slice(0, 6)}...${depositAddr.slice(-4)}` : '-'
         return (
-          <Space>
-            <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{formatted}</span>
-            <Button
-              type="text"
-              size="small"
-              icon={<CopyOutlined />}
-              onClick={(e) => {
-                e.stopPropagation()
-                handleCopy(address)
-              }}
-              title={t('accountList.proxyAddress')}
-            />
+          <Space direction="vertical" size={2} style={{ width: '100%' }}>
+            <Space>
+              <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{formatted}</span>
+              <Button
+                type="text"
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  handleCopy(address)
+                }}
+                title={t('accountList.proxyAddress')}
+              />
+            </Space>
+            {isDeposit && (
+              <Space size={4}>
+                <Tag color="cyan" style={{ margin: 0, fontSize: '10px' }}>Deposit Wallet</Tag>
+                <span style={{ fontFamily: 'monospace', fontSize: '12px' }}>{depositFormatted}</span>
+                {depositAddr && (
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<CopyOutlined />}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleCopy(depositAddr)
+                    }}
+                    title={t('account.depositWalletAddress')}
+                  />
+                )}
+              </Space>
+            )}
           </Space>
         )
       }
@@ -372,7 +395,22 @@ const AccountList: React.FC = () => {
         }
         const balanceObj = balanceMap[record.id]
         const balance = balanceObj?.total || record.balance || '-'
-        return balance && balance !== '-' && typeof balance === 'string' ? `$${formatUSDC(balance)}` : '-'
+        const formatted = balance && balance !== '-' && typeof balance === 'string' ? `$${formatUSDC(balance)}` : '-'
+        const isDeposit = record.walletFlowType === 'DEPOSIT_WALLET'
+        if (!isDeposit) {
+          return formatted
+        }
+        const pusd = record.pUsdBalance
+        return (
+          <Space direction="vertical" size={2}>
+            <span>{formatted}</span>
+            {pusd !== undefined && pusd !== null && (
+              <span style={{ fontSize: '11px', color: '#8c8c8c' }}>
+                pUSD: ${formatUSDC(String(pusd))}
+              </span>
+            )}
+          </Space>
+        )
       }
     },
     {
@@ -605,6 +643,11 @@ const AccountList: React.FC = () => {
                           <div style={{ fontSize: '14px', fontWeight: '600', color: '#52c41a' }}>
                             {balance?.total && balance.total !== '-' ? `$${formatUSDC(balance.total)}` : '-'}
                           </div>
+                          {account.walletFlowType === 'DEPOSIT_WALLET' && account.pUsdBalance !== undefined && account.pUsdBalance !== null && (
+                            <div style={{ fontSize: '10px', color: '#8c8c8c', marginTop: 2 }}>
+                              pUSD: ${formatUSDC(String(account.pUsdBalance))}
+                            </div>
+                          )}
                         </div>
                         <div style={{ textAlign: 'right' }}>
                           <div style={{ fontSize: '10px', color: '#8c8c8c' }}>
@@ -638,6 +681,23 @@ const AccountList: React.FC = () => {
                           style={{ padding: '0 4px', height: 'auto' }}
                         />
                       </div>
+                      {account.walletFlowType === 'DEPOSIT_WALLET' && (
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
+                          <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <Tag color="cyan" style={{ margin: 0, fontSize: '10px', lineHeight: '14px', padding: '0 4px' }}>Deposit Wallet</Tag>
+                            {account.depositWalletAddress ? `${account.depositWalletAddress.slice(0, 6)}...${account.depositWalletAddress.slice(-4)}` : '-'}
+                          </span>
+                          {account.depositWalletAddress && (
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<CopyOutlined style={{ fontSize: '12px' }} />}
+                              onClick={() => handleCopy(account.depositWalletAddress!)}
+                              style={{ padding: '0 4px', height: 'auto' }}
+                            />
+                          )}
+                        </div>
+                      )}
                     </div>
 
                     {/* 图标操作栏 */}
@@ -830,6 +890,31 @@ const AccountList: React.FC = () => {
                   <Tag color={detailAccount.walletType.toLowerCase() === 'magic' ? 'purple' : 'blue'}>
                     {detailAccount.walletType.toLowerCase() === 'magic' ? 'Magic' : 'Safe'}
                   </Tag>
+                </Descriptions.Item>
+              )}
+              {detailAccount.walletFlowType === 'DEPOSIT_WALLET' && (
+                <Descriptions.Item label={t('account.depositWalletAddress')} span={isMobile ? 1 : 2}>
+                  <Space>
+                    <Tag color="cyan" style={{ margin: 0 }}>Deposit Wallet</Tag>
+                    <Typography.Text
+                      copyable={detailAccount.depositWalletAddress ? { text: detailAccount.depositWalletAddress, onCopy: () => message.success(t('accountList.copySuccess')) } : false}
+                      style={{
+                        fontFamily: 'monospace',
+                        fontSize: isMobile ? '11px' : '13px',
+                        wordBreak: 'break-all',
+                        lineHeight: '1.4'
+                      }}
+                    >
+                      {detailAccount.depositWalletAddress || '-'}
+                    </Typography.Text>
+                  </Space>
+                </Descriptions.Item>
+              )}
+              {detailAccount.walletFlowType === 'DEPOSIT_WALLET' && detailAccount.pUsdBalance !== undefined && detailAccount.pUsdBalance !== null && (
+                <Descriptions.Item label={t('account.pUsdBalance')}>
+                  <span style={{ fontWeight: 'bold', color: '#13c2c2' }}>
+                    ${formatUSDC(String(detailAccount.pUsdBalance))}
+                  </span>
                 </Descriptions.Item>
               )}
               <Descriptions.Item label={t('accountList.totalBalance')} span={isMobile ? 1 : 2}>

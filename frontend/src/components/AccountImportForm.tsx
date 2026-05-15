@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { Form, Input, Button, Radio, Space, Card, Spin, message, Alert, Steps, Tag } from 'antd'
-import { KeyOutlined, WalletOutlined, UserOutlined, CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
+import { Form, Input, Button, Radio, Space, Card, Spin, message, Alert, Steps, Tag, Typography } from 'antd'
+import { KeyOutlined, WalletOutlined, UserOutlined, CheckCircleOutlined, ExclamationCircleOutlined, ApiOutlined } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { useAccountStore } from '../store/accountStore'
 import {
@@ -14,7 +14,7 @@ import {
 } from '../utils'
 import { useMediaQuery } from 'react-responsive'
 import { apiService } from '../services/api'
-import type { ProxyOption } from '../types'
+import type { ProxyOption, WalletFlowType } from '../types'
 import AccountSetupGuideModal from './AccountSetupGuideModal'
 
 type ImportType = 'privateKey' | 'mnemonic'
@@ -35,6 +35,7 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
   const { t } = useTranslation()
   const isMobile = useMediaQuery({ maxWidth: 768 })
   const { importAccount, loading } = useAccountStore()
+  const [walletFlowType, setWalletFlowType] = useState<WalletFlowType>('LEGACY')
   const [importType, setImportType] = useState<ImportType>('privateKey')
   const [derivedAddress, setDerivedAddress] = useState<string>('')
   const [addressError, setAddressError] = useState<string>('')
@@ -77,10 +78,18 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
       const address = getAddressFromPrivateKey(privateKey)
       setDerivedAddress(address)
       setAddressError('')
-      
+
       // 自动填充钱包地址字段
       form.setFieldsValue({ walletAddress: address })
-      
+
+      // DEPOSIT_WALLET 流程不需要查询 Magic/Safe 代理选项，直接进入下一步
+      if (walletFlowType === 'DEPOSIT_WALLET') {
+        setProxyOptions([])
+        setSelectedProxyType('DEPOSIT_WALLET')
+        setStep('select')
+        return
+      }
+
       // 延迟获取代理选项（避免频繁请求）
       setTimeout(() => {
         fetchProxyOptions(address, privateKey, null)
@@ -125,10 +134,18 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
       const address = getAddressFromMnemonic(mnemonic, 0)
       setDerivedAddress(address)
       setAddressError('')
-      
+
       // 自动填充钱包地址字段
       form.setFieldsValue({ walletAddress: address })
-      
+
+      // DEPOSIT_WALLET 流程不需要查询 Magic/Safe 代理选项，直接进入下一步
+      if (walletFlowType === 'DEPOSIT_WALLET') {
+        setProxyOptions([])
+        setSelectedProxyType('DEPOSIT_WALLET')
+        setStep('select')
+        return
+      }
+
       // 延迟获取代理选项（避免频繁请求）
       setTimeout(() => {
         fetchProxyOptions(address, null, mnemonic)
@@ -198,6 +215,16 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
     setStep('input')
     form.setFieldsValue({ walletAddress: '', privateKey: '', mnemonic: '' })
   }, [importType])
+
+  // 切换钱包流程类型时重置状态（清空表单，避免 LEGACY/DEPOSIT_WALLET 状态串扰）
+  useEffect(() => {
+    setDerivedAddress('')
+    setAddressError('')
+    setProxyOptions([])
+    setSelectedProxyType('')
+    setStep('input')
+    form.setFieldsValue({ walletAddress: '', privateKey: '', mnemonic: '' })
+  }, [walletFlowType])
   
   const handleSubmit = async (values: any) => {
     try {
@@ -249,7 +276,9 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
         privateKey: privateKey,
         walletAddress: walletAddress,
         accountName: values.accountName,
-        walletType: selectedProxyType
+        // DEPOSIT_WALLET 流程不存在 magic/safe 区分，不传 walletType；后端按 walletFlowType 派发
+        walletType: walletFlowType === 'DEPOSIT_WALLET' ? undefined : selectedProxyType,
+        walletFlowType
       })
       
       // 等待store更新
@@ -272,7 +301,10 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
             if (setupResponse.data.code === 0 && setupResponse.data.data) {
               const status = setupResponse.data.data
               setSetupStatus(status)
-              const hasIncomplete = !status.proxyDeployed || !status.tradingEnabled || !status.tokensApproved
+              const hasIncomplete = !status.proxyDeployed
+                || !status.tradingEnabled
+                || !status.tokensApproved
+                || (status.walletFlowType === 'DEPOSIT_WALLET' && !status.balanceSynced)
               if (hasIncomplete) {
                 setSetupModalVisible(true)
                 willShowSetupModal = true
@@ -321,6 +353,37 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
         onFinish={handleSubmit}
         size={isMobile ? 'middle' : 'large'}
       >
+        <Form.Item label={t('accountImport.walletFlow.label', '钱包流程')} style={{ marginBottom: 16 }}>
+          <Radio.Group
+            value={walletFlowType}
+            onChange={(e) => setWalletFlowType(e.target.value)}
+            optionType="button"
+            buttonStyle="solid"
+            size={isMobile ? 'middle' : 'large'}
+          >
+            <Radio.Button value="LEGACY">
+              {t('accountImport.walletFlow.legacy', 'Magic / Safe (既有流程)')}
+            </Radio.Button>
+            <Radio.Button value="DEPOSIT_WALLET">
+              {t('accountImport.walletFlow.depositWallet', 'New API user (Deposit Wallet)')}
+            </Radio.Button>
+          </Radio.Group>
+          <Typography.Paragraph
+            type="secondary"
+            style={{ marginTop: 8, marginBottom: 0, fontSize: 12 }}
+          >
+            {walletFlowType === 'DEPOSIT_WALLET'
+              ? t(
+                  'accountImport.walletFlow.depositWalletHint',
+                  'Deposit wallet 将由系统在导入后自动部署 (Polymarket POLY_1271 流程)'
+                )
+              : t(
+                  'accountImport.walletFlow.legacyHint',
+                  '兼容现有 Magic / Safe 代理钱包流程'
+                )}
+          </Typography.Paragraph>
+        </Form.Item>
+
         <Form.Item label={t('accountImport.importMethod')} style={{ marginBottom: 16 }}>
           <Radio.Group
             value={importType}
@@ -448,8 +511,24 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
           </>
         )}
         
-        {/* 请求代理地址时的 loading 提示 */}
-        {loadingProxyOptions && step === 'input' && (
+        {/* DEPOSIT_WALLET 流程：展示信息面板，跳过 Magic/Safe 代理选择 */}
+        {walletFlowType === 'DEPOSIT_WALLET' && derivedAddress && !addressError && (
+          <Form.Item style={{ marginBottom: 20 }}>
+            <Alert
+              type="info"
+              showIcon
+              icon={<ApiOutlined />}
+              message={t('accountImport.depositWallet.infoTitle', 'Deposit Wallet (POLY_1271) 流程')}
+              description={t(
+                'accountImport.depositWallet.infoDescription',
+                'Deposit wallet 将由系统在导入后自动部署 (Polymarket POLY_1271 流程)，无需选择 Magic / Safe 代理。'
+              )}
+            />
+          </Form.Item>
+        )}
+
+        {/* 请求代理地址时的 loading 提示（仅 LEGACY 流程） */}
+        {walletFlowType === 'LEGACY' && loadingProxyOptions && step === 'input' && (
           <Form.Item>
             <Alert
               message={
@@ -464,9 +543,9 @@ const AccountImportForm: React.FC<AccountImportFormProps> = ({
             />
           </Form.Item>
         )}
-        
-        {/* 代理地址选项选择 */}
-        {step === 'select' && (
+
+        {/* 代理地址选项选择（仅 LEGACY 流程；DEPOSIT_WALLET 不需要） */}
+        {walletFlowType === 'LEGACY' && step === 'select' && (
           <Form.Item
             label={t('accountImport.selectProxyOption')}
             required

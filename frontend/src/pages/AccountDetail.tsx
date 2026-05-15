@@ -187,8 +187,8 @@ const AccountDetail: React.FC = () => {
             </Descriptions.Item>
           )}
           <Descriptions.Item label={t('account.walletAddress')} span={isMobile ? 1 : 2}>
-            <span style={{ 
-              fontFamily: 'monospace', 
+            <span style={{
+              fontFamily: 'monospace',
               fontSize: isMobile ? '11px' : '14px',
               wordBreak: 'break-all',
               lineHeight: '1.4',
@@ -197,6 +197,24 @@ const AccountDetail: React.FC = () => {
               {account.walletAddress}
             </span>
           </Descriptions.Item>
+          {account.walletFlowType === 'DEPOSIT_WALLET' && (
+            <Descriptions.Item label={t('account.depositWalletAddress')} span={isMobile ? 1 : 2}>
+              <Space>
+                <Tag color="cyan" style={{ margin: 0 }}>Deposit Wallet</Tag>
+                <Typography.Text
+                  copyable={account.depositWalletAddress ? { text: account.depositWalletAddress } : false}
+                  style={{
+                    fontFamily: 'monospace',
+                    fontSize: isMobile ? '11px' : '14px',
+                    wordBreak: 'break-all',
+                    lineHeight: '1.4'
+                  }}
+                >
+                  {account.depositWalletAddress || '-'}
+                </Typography.Text>
+              </Space>
+            </Descriptions.Item>
+          )}
           <Descriptions.Item label={t('account.balance')}>
             {balanceLoading ? (
               <Spin size="small" />
@@ -208,6 +226,13 @@ const AccountDetail: React.FC = () => {
               <span style={{ color: '#999' }}>-</span>
             )}
           </Descriptions.Item>
+          {account.walletFlowType === 'DEPOSIT_WALLET' && account.pUsdBalance !== undefined && account.pUsdBalance !== null && (
+            <Descriptions.Item label={t('account.pUsdBalance')}>
+              <span style={{ fontWeight: 'bold', color: '#13c2c2' }}>
+                ${formatUSDC(String(account.pUsdBalance))}
+              </span>
+            </Descriptions.Item>
+          )}
         </Descriptions>
       </Card>
       

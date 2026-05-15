@@ -83,7 +83,12 @@
     "updateFailed": "更新賬戶失敗",
     "getDetailFailed": "獲取賬戶詳情失敗",
     "accountIdRequired": "賬戶ID不能為空",
-    "proxyAddress": "代理錢包地址"
+    "proxyAddress": "代理錢包地址",
+    "flowType": "賬戶類型",
+    "flowType.legacy": "Magic / Safe（舊版）",
+    "flowType.depositWallet": "Deposit 錢包（新 API 用戶）",
+    "depositWalletAddress": "Deposit 錢包地址",
+    "pUsdBalance": "pUSD 餘額"
   },
   "message": {
     "success": "操作成功",
@@ -241,6 +246,17 @@
       "hasAssets": "有資產",
       "error": "獲取失敗",
       "select": "選擇此代理地址"
+    },
+    "walletFlow": {
+      "label": "錢包流程",
+      "legacy": "Magic / Safe（舊版）",
+      "depositWallet": "新 API 用戶 (Deposit 錢包)",
+      "legacyHint": "相容現有 Magic / Safe 代理錢包流程。",
+      "depositWalletHint": "系統將透過 Polymarket relayer 自動部署一個新的 ERC-1967 deposit 錢包，您的資金將存放於該錢包並用於 CLOB 交易。"
+    },
+    "depositWallet": {
+      "infoTitle": "Deposit Wallet (POLY_1271) 流程",
+      "infoDescription": "Deposit wallet 將由系統在匯入後自動部署 (Polymarket POLY_1271 流程)，無需選擇 Magic / Safe 代理。"
     }
   },
   "accountSetup": {
@@ -286,7 +302,34 @@
     },
     "actionSuccess": "操作成功",
     "actionFailed": "操作失敗，請稍後重試",
-    "help": "提示：完成設置後，點擊「刷新狀態」按鈕更新檢查結果。如果所有步驟都已完成，您可以正常使用帳戶功能。"
+    "copied": "已複製",
+    "help": "提示：完成設置後，點擊「刷新狀態」按鈕更新檢查結果。如果所有步驟都已完成，您可以正常使用帳戶功能。",
+    "depositWallet": {
+      "address": {
+        "title": "Deposit 錢包地址",
+        "copy": "複製"
+      },
+      "step1": {
+        "title": "部署 Deposit 錢包",
+        "description": "透過 Polymarket relayer 在 Polygon 上部署一個新的 ERC-1967 代理 deposit 錢包，資金將存放在此錢包中用於 CLOB 交易。",
+        "action": "部署"
+      },
+      "step2": {
+        "title": "啟用交易",
+        "description": "需要配置 API 憑證才能進行交易。點擊下方按鈕由系統自動獲取並保存 API Key。",
+        "action": "一鍵啟用交易"
+      },
+      "step3": {
+        "title": "授權 pUSD 與 CTF",
+        "description": "向 CLOB 交易所授予 pUSD 與 CTF 的 approve 權限。所有授權呼叫都透過 deposit 錢包以單筆 WALLET 批量交易送出。",
+        "action": "授權"
+      },
+      "step4": {
+        "title": "同步 CLOB 餘額",
+        "description": "刷新 CLOB 餘額快取，使 deposit 錢包中的 pUSD 資金被 CLOB 正確辨識。",
+        "action": "同步"
+      }
+    }
   },
   "leader": {
     "title": "Leader 管理",

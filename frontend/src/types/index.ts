@@ -8,15 +8,29 @@ export interface ApiResponse<T> {
 }
 
 /**
+ * 钱包流程：LEGACY (Magic / Safe) 或 DEPOSIT_WALLET (POLY_1271 新 API 流程)
+ * 参考: https://docs.polymarket.com/trading/deposit-wallets
+ */
+export type WalletFlowType = 'LEGACY' | 'DEPOSIT_WALLET'
+
+/**
  * 账户信息
  */
 export interface Account {
   id: number
   walletAddress: string
-  proxyAddress: string  // Polymarket 代理钱包地址
+  proxyAddress: string  // Polymarket 代理钱包地址（LEGACY 流程）；DEPOSIT_WALLET 流程下可与 depositWalletAddress 相同
   accountName?: string
   isEnabled?: boolean  // 是否启用
   walletType?: string  // 钱包类型：magic（邮箱/OAuth登录）或 safe（MetaMask浏览器钱包）
+  /** 钱包流程类型；缺省视为 LEGACY 以兼容现有账户 */
+  walletFlowType?: WalletFlowType
+  /** Deposit wallet ERC-1967 proxy 地址（仅 DEPOSIT_WALLET 流程，未部署前可能为 null） */
+  depositWalletAddress?: string | null
+  /** Deposit wallet 的 owner / signer 地址，通常等同 walletAddress */
+  depositWalletOwner?: string | null
+  /** pUSD 余额（DEPOSIT_WALLET 流程；LEGACY 流程使用 balance） */
+  pUsdBalance?: string
   apiKeyConfigured: boolean
   apiSecretConfigured: boolean
   apiPassphraseConfigured: boolean
@@ -44,6 +58,8 @@ export interface AccountImportRequest {
   walletAddress: string
   accountName?: string
   walletType?: string  // 钱包类型：magic（邮箱/OAuth登录）或 safe（MetaMask浏览器钱包）
+  /** 钱包流程类型；缺省由后端视为 LEGACY 以兼容现有行为 */
+  walletFlowType?: WalletFlowType
 }
 
 /**
@@ -68,6 +84,8 @@ export interface ProxyOption {
   positionCount: number  // 持仓数量
   hasAssets: boolean  // 是否有资产
   error?: string  // 获取失败时的错误信息
+  /** 钱包流程类型；预留给未来后端返回 DEPOSIT_WALLET 选项时使用 */
+  walletFlowType?: WalletFlowType
 }
 
 /**

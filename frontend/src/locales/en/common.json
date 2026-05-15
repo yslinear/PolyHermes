@@ -83,7 +83,12 @@
     "updateFailed": "Failed to update account",
     "getDetailFailed": "Failed to get account details",
     "accountIdRequired": "Account ID cannot be empty",
-    "proxyAddress": "Proxy Wallet Address"
+    "proxyAddress": "Proxy Wallet Address",
+    "flowType": "Account Type",
+    "flowType.legacy": "Magic / Safe (legacy)",
+    "flowType.depositWallet": "Deposit Wallet (new API user)",
+    "depositWalletAddress": "Deposit Wallet Address",
+    "pUsdBalance": "pUSD Balance"
   },
   "message": {
     "success": "Operation successful",
@@ -241,6 +246,17 @@
       "hasAssets": "Has Assets",
       "error": "Failed to fetch",
       "select": "Select this proxy address"
+    },
+    "walletFlow": {
+      "label": "Wallet Flow",
+      "legacy": "Magic / Safe (legacy)",
+      "depositWallet": "New API user (Deposit Wallet)",
+      "legacyHint": "Compatible with the existing Magic / Safe proxy wallet flow.",
+      "depositWalletHint": "A new ERC-1967 deposit wallet will be deployed via the Polymarket relayer. Your funds will be held in this deposit wallet and used for CLOB trading."
+    },
+    "depositWallet": {
+      "infoTitle": "Deposit Wallet (POLY_1271) Flow",
+      "infoDescription": "The deposit wallet will be deployed automatically by the system after import (Polymarket POLY_1271 flow). No Magic / Safe proxy selection is required."
     }
   },
   "accountSetup": {
@@ -286,7 +302,34 @@
     },
     "actionSuccess": "Operation successful",
     "actionFailed": "Operation failed, please try again later",
-    "help": "Tip: After completing the setup, click the \"Refresh Status\" button to update the check results. If all steps are completed, you can use account features normally."
+    "copied": "Copied",
+    "help": "Tip: After completing the setup, click the \"Refresh Status\" button to update the check results. If all steps are completed, you can use account features normally.",
+    "depositWallet": {
+      "address": {
+        "title": "Deposit Wallet Address",
+        "copy": "Copy"
+      },
+      "step1": {
+        "title": "Deploy Deposit Wallet",
+        "description": "Deploy a new ERC-1967 proxy deposit wallet on Polygon through the Polymarket relayer. This wallet will hold funds used for CLOB trading.",
+        "action": "Deploy"
+      },
+      "step2": {
+        "title": "Enable Trading",
+        "description": "API credentials are required for trading. Click the button below to let the system automatically obtain and save the API Key.",
+        "action": "Enable Trading (One-Click)"
+      },
+      "step3": {
+        "title": "Approve pUSD & CTF",
+        "description": "Grant pUSD and CTF approvals to the CLOB exchanges. The approval calls are dispatched from the deposit wallet via a single WALLET-type relayer batch.",
+        "action": "Approve"
+      },
+      "step4": {
+        "title": "Sync CLOB Balance",
+        "description": "Refresh the CLOB balance cache so the deposit wallet's pUSD funds are recognized for trading.",
+        "action": "Sync"
+      }
+    }
   },
   "leader": {
     "title": "Leader Management",

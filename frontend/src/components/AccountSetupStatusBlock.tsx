@@ -7,7 +7,9 @@ import {
   KeyOutlined,
   SafetyOutlined,
   LinkOutlined,
-  ReloadOutlined
+  ReloadOutlined,
+  SyncOutlined,
+  CopyOutlined
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { apiService } from '../services/api'
@@ -20,6 +22,9 @@ export interface SetupStatus {
   tokensApproved: boolean
   approvalDetails?: Record<string, string>
   error?: string
+  walletFlowType?: 'LEGACY' | 'DEPOSIT_WALLET'
+  depositWalletAddress?: string | null
+  balanceSynced?: boolean
 }
 
 interface AccountSetupStatusBlockProps {
@@ -32,10 +37,15 @@ interface AccountSetupStatusBlockProps {
   embedded?: boolean
 }
 
-/** 步骤 key 与步骤编号对应 */
+/**
+ * 步骤 key 与步骤编号对应。
+ * LEGACY 流程 3 步、DEPOSIT_WALLET 流程 4 步；step1/2/3 在两条流程中
+ * 语义不同（合约/动作不同），因此查表时必须按当前流程使用对应数组，
+ * 避免 deposit 流程的 step4 在 legacy 数组中查不到、或 legacy 的 stepN
+ * 误指 deposit 数组中同名但语义不同的步骤。
+ */
 const STEP_KEYS = ['step1', 'step2', 'step3'] as const
-const stepKeyToNumber = (key: string): number =>
-  STEP_KEYS.indexOf(key as typeof STEP_KEYS[number]) + 1
+const STEP_KEYS_DEPOSIT = ['step1', 'step2', 'step3', 'step4'] as const
 
 const AccountSetupStatusBlock: React.FC<AccountSetupStatusBlockProps> = ({
   accountId,
@@ -74,26 +84,32 @@ const AccountSetupStatusBlock: React.FC<AccountSetupStatusBlockProps> = ({
     fetchStatus()
   }, [accountId])
 
+  const isDepositFlow = setupStatus?.walletFlowType === 'DEPOSIT_WALLET'
+
   // 每 5 秒轮询最新状态（首次加载完成后且存在未完成步骤时轮询，全部完成后停止）
   useEffect(() => {
     if (accountId <= 0 || setupStatus == null) return
-    const allCompleted =
+    const baseCompleted =
       setupStatus.proxyDeployed &&
       setupStatus.tradingEnabled &&
       setupStatus.tokensApproved
+    const allCompleted = isDepositFlow
+      ? baseCompleted && !!setupStatus.balanceSynced
+      : baseCompleted
     if (allCompleted) return
     const timer = setInterval(() => {
       fetchStatus()
     }, 5000)
     return () => clearInterval(timer)
-  }, [accountId, setupStatus?.proxyDeployed, setupStatus?.tradingEnabled, setupStatus?.tokensApproved])
+  }, [accountId, isDepositFlow, setupStatus?.proxyDeployed, setupStatus?.tradingEnabled, setupStatus?.tokensApproved, setupStatus?.balanceSynced])
 
   // 全部完成时通知父组件（供弹窗等关闭或更新用）
   const allCompleted =
     setupStatus != null &&
     setupStatus.proxyDeployed &&
     setupStatus.tradingEnabled &&
-    setupStatus.tokensApproved
+    setupStatus.tokensApproved &&
+    (!isDepositFlow || !!setupStatus.balanceSynced)
   useEffect(() => {
     if (allCompleted) onAllCompleted?.()
   }, [allCompleted, onAllCompleted])
@@ -105,7 +121,8 @@ const AccountSetupStatusBlock: React.FC<AccountSetupStatusBlockProps> = ({
   }
 
   const handleStepAction = async (key: string) => {
-    const stepNum = stepKeyToNumber(key)
+    // 按当前流程从对应数组查表，避免 LEGACY/DEPOSIT_WALLET 步骤错位
+    const stepNum = (isDepositFlow ? STEP_KEYS_DEPOSIT : STEP_KEYS).indexOf(key as never) + 1
     if (stepNum < 1) return
     setActionLoading(key)
     try {
@@ -160,7 +177,7 @@ const AccountSetupStatusBlock: React.FC<AccountSetupStatusBlockProps> = ({
     )
   }
 
-  const steps = [
+  const legacySteps = [
     {
       key: 'step1',
       title: t('accountSetup.step1.title'),
@@ -187,8 +204,86 @@ const AccountSetupStatusBlock: React.FC<AccountSetupStatusBlockProps> = ({
     }
   ]
 
+  const depositWalletSteps = [
+    {
+      key: 'step1',
+      title: t('accountSetup.depositWallet.step1.title'),
+      description: t('accountSetup.depositWallet.step1.description'),
+      icon: <WalletOutlined />,
+      completed: setupStatus.proxyDeployed,
+      actionLabel: t('accountSetup.depositWallet.step1.action')
+    },
+    {
+      key: 'step2',
+      title: t('accountSetup.depositWallet.step2.title'),
+      description: t('accountSetup.depositWallet.step2.description'),
+      icon: <KeyOutlined />,
+      completed: setupStatus.tradingEnabled,
+      actionLabel: t('accountSetup.depositWallet.step2.action')
+    },
+    {
+      key: 'step3',
+      title: t('accountSetup.depositWallet.step3.title'),
+      description: t('accountSetup.depositWallet.step3.description'),
+      icon: <SafetyOutlined />,
+      completed: setupStatus.tokensApproved,
+      actionLabel: t('accountSetup.depositWallet.step3.action')
+    },
+    {
+      key: 'step4',
+      title: t('accountSetup.depositWallet.step4.title'),
+      description: t('accountSetup.depositWallet.step4.description'),
+      icon: <SyncOutlined />,
+      completed: !!setupStatus.balanceSynced,
+      actionLabel: t('accountSetup.depositWallet.step4.action')
+    }
+  ]
+
+  const steps = isDepositFlow ? depositWalletSteps : legacySteps
+
+  const handleCopyDepositAddress = async () => {
+    if (!setupStatus.depositWalletAddress) return
+    try {
+      await navigator.clipboard.writeText(setupStatus.depositWalletAddress)
+      message.success(t('accountSetup.copied'))
+    } catch {
+      message.error(t('accountSetup.actionFailed'))
+    }
+  }
+
   const stepsContent = (
     <>
+      {isDepositFlow && setupStatus.depositWalletAddress && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: '10px 12px',
+            background: '#f6ffed',
+            border: '1px solid #b7eb8f',
+            borderRadius: 4,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 8
+          }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <Text strong style={{ display: 'block', fontSize: 13 }}>
+              {t('accountSetup.depositWallet.address.title')}
+            </Text>
+            <Text code style={{ fontSize: 12, wordBreak: 'break-all' }}>
+              {setupStatus.depositWalletAddress}
+            </Text>
+          </div>
+          <Button
+            size="small"
+            icon={<CopyOutlined />}
+            onClick={handleCopyDepositAddress}
+          >
+            {t('accountSetup.depositWallet.address.copy')}
+          </Button>
+        </div>
+      )}
       <Steps
         direction="vertical"
         current={steps.findIndex(s => !s.completed)}

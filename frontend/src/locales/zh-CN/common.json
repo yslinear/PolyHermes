@@ -119,7 +119,12 @@
     "getDetailFailed": "获取账户详情失败",
     "updateSuccess": "更新账户成功",
     "updateFailed": "更新账户失败",
-    "refreshBalance": "刷新余额"
+    "refreshBalance": "刷新余额",
+    "flowType": "账户类型",
+    "flowType.legacy": "Magic / Safe（旧版）",
+    "flowType.depositWallet": "Deposit 钱包（新 API 用户）",
+    "depositWalletAddress": "Deposit 钱包地址",
+    "pUsdBalance": "pUSD 余额"
   },
   "accountList": {
     "title": "账户管理",
@@ -241,6 +246,17 @@
       "hasAssets": "有资产",
       "error": "获取失败",
       "select": "选择此代理地址"
+    },
+    "walletFlow": {
+      "label": "钱包流程",
+      "legacy": "Magic / Safe（旧版）",
+      "depositWallet": "新 API 用户 (Deposit 钱包)",
+      "legacyHint": "兼容现有 Magic / Safe 代理钱包流程。",
+      "depositWalletHint": "系统将通过 Polymarket relayer 自动部署一个新的 ERC-1967 deposit 钱包，您的资金将存放于该钱包并用于 CLOB 交易。"
+    },
+    "depositWallet": {
+      "infoTitle": "Deposit Wallet (POLY_1271) 流程",
+      "infoDescription": "Deposit wallet 将由系统在导入后自动部署 (Polymarket POLY_1271 流程)，无需选择 Magic / Safe 代理。"
     }
   },
   "accountSetup": {
@@ -286,7 +302,34 @@
     },
     "actionSuccess": "操作成功",
     "actionFailed": "操作失败，请稍后重试",
-    "help": "提示：完成设置后，点击「刷新状态」按钮更新检查结果。如果所有步骤都已完成，您可以正常使用账户功能。"
+    "copied": "已复制",
+    "help": "提示：完成设置后，点击「刷新状态」按钮更新检查结果。如果所有步骤都已完成，您可以正常使用账户功能。",
+    "depositWallet": {
+      "address": {
+        "title": "Deposit 钱包地址",
+        "copy": "复制"
+      },
+      "step1": {
+        "title": "部署 Deposit 钱包",
+        "description": "通过 Polymarket relayer 在 Polygon 上部署一个新的 ERC-1967 代理 deposit 钱包，资金将存放在此钱包中用于 CLOB 交易。",
+        "action": "部署"
+      },
+      "step2": {
+        "title": "启用交易",
+        "description": "需要配置 API 凭证才能进行交易。点击下方按钮由系统自动获取并保存 API Key。",
+        "action": "一键启用交易"
+      },
+      "step3": {
+        "title": "授权 pUSD 和 CTF",
+        "description": "向 CLOB 交易所授予 pUSD 与 CTF 的 approve 权限。所有授权调用都通过 deposit 钱包以单笔 WALLET 批量交易发送。",
+        "action": "授权"
+      },
+      "step4": {
+        "title": "同步 CLOB 余额",
+        "description": "刷新 CLOB 余额缓存，使 deposit 钱包中的 pUSD 资金被 CLOB 正确识别。",
+        "action": "同步"
+      }
+    }
   },
   "leader": {
     "title": "Leader 管理",
