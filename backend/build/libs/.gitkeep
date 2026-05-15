@@ -1,0 +1,6 @@
+# Placeholder
+# 这个空目录给 Dockerfile COPY backend/build ./build-external 使用。
+# 当 BUILD_IN_DOCKER=true（本地开发）且本机未跑 `./gradlew bootJar` 时，
+# 没有这个 stub 目录会导致 docker build 在 L74 失败：
+#   "failed to compute cache key: ... /backend/build: not found"
+# 详见 Dockerfile 第 70-86 行的条件构建逻辑。

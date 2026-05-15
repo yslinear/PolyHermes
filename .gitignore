@@ -11,7 +11,13 @@
 
 # Gradle
 backend/.gradle/
-backend/build/
+# 忽略 backend/build/ 内的所有产物，但保留 backend/build/libs/.gitkeep 作占位，
+# 让 Dockerfile `COPY backend/build ./build-external` 在本地未跑 ./gradlew bootJar 时也能成功
+# (BUILD_IN_DOCKER=true 路径会在 docker 内重新编译，本地 stub 目录不会污染产物)
+backend/build/*
+!backend/build/libs
+backend/build/libs/*
+!backend/build/libs/.gitkeep
 backend/bin/
 backend/out/
 backend/*.log
